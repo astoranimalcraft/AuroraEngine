@@ -1,3 +1,4 @@
+![Logo Completo](NexiumEngineLogoCompleto.png)
 # Aurora3D
 
 Uma biblioteca 3D pequena e autossuficiente para **C++20**, construída direto sobre
