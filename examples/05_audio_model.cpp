@@ -1,4 +1,4 @@
-// Aurora3D — example: a 3D scene with sound, a loaded model and shader states.
+// NexiumEngine — example: a 3D scene with sound, a loaded model and shader states.
 //
 // Exercises the subsystems added on top of the core: an OBJ model with a material,
 // a looping music track, a sound effect triggered by a key, and BeginShader() to
@@ -6,23 +6,23 @@
 //
 // Every resource is optional: if the files are missing, or there is no audio
 // device, the example still runs and just draws the fallback cube.
-#include <aurora/aurora.h>
+#include <nexium/NexiumEngine.h>
 
 #include <cmath>
 
 namespace {
 
-a3d::OrbitCamera gOrbit;
+n3d::OrbitCamera gOrbit;
 
 const char* kOutlineHlsl = R"HLSL(
-#include "aurora.hlsli"
+#include "nexium.hlsli"
 
-A3D_VertexOutput VSMain(A3D_VertexInput input)
+N3D_VertexOutput VSMain(N3D_VertexInput input)
 {
-    return A3D_TransformVertex(input);
+    return N3D_TransformVertex(input);
 }
 
-float4 PSMain(A3D_VertexOutput input, bool isFrontFace : SV_IsFrontFace) : SV_TARGET
+float4 PSMain(N3D_VertexOutput input, bool isFrontFace : SV_IsFrontFace) : SV_TARGET
 {
     // Rim light: bright at grazing angles, dark head-on. Reads as an outline.
     float3 view = normalize(cameraPosTime.xyz - input.worldPos);
@@ -34,77 +34,77 @@ float4 PSMain(A3D_VertexOutput input, bool isFrontFace : SV_IsFrontFace) : SV_TA
 } // namespace
 
 int main() {
-    a3d::Config config;
-    config.title = "Aurora3D — Model, Sound & Shaders";
+    n3d::Config config;
+    config.title = "NexiumEngine — Model, Sound & Shaders";
     config.width = 1280;
     config.height = 720;
-    if (!a3d::Init(config)) return 1;
+    if (!n3d::Init(config)) return 1;
 
     gOrbit.distance = 8.0f;
-    a3d::SetLightDirection(a3d::Vec3{-0.4f, -1.0f, -0.3f});
-    a3d::SetAmbient(a3d::colors::White, 0.25f);
+    n3d::SetLightDirection(n3d::Vec3{-0.4f, -1.0f, -0.3f});
+    n3d::SetAmbient(n3d::colors::White, 0.25f);
 
     // A model, if one is around. The built-in loader reads OBJ/MTL with no extra
-    // dependency; any other format needs AURORA_HAS_ASSIMP.
-    a3d::Model* model = a3d::LoadModel("assets/robot.obj");
-    if (!model) a3d::LogInfo("no assets/robot.obj — drawing the fallback cube");
+    // dependency; any other format needs NEXIUM_HAS_ASSIMP.
+    n3d::Model* model = n3d::LoadModel("assets/robot.obj");
+    if (!model) n3d::LogInfo("no assets/robot.obj — drawing the fallback cube");
 
-    a3d::Sound* beep = a3d::LoadSound("assets/beep.wav");
-    a3d::Music* music = a3d::LoadMusic("assets/music.wav");
+    n3d::Sound* beep = n3d::LoadSound("assets/beep.wav");
+    n3d::Music* music = n3d::LoadMusic("assets/music.wav");
     if (music) {
-        a3d::SetMusicVolume(music, 0.5f);
-        a3d::SetMusicLooping(music, true);
-        a3d::PlayMusic(music);
+        n3d::SetMusicVolume(music, 0.5f);
+        n3d::SetMusicLooping(music, true);
+        n3d::PlayMusic(music);
     }
 
-    a3d::Shader* outline = a3d::LoadShaderFromMemory(kOutlineHlsl, "outline");
-    const a3d::Mesh* cube = a3d::GetCubeMesh(1.0f);
+    n3d::Shader* outline = n3d::LoadShaderFromMemory(kOutlineHlsl, "outline");
+    const n3d::Mesh* cube = n3d::GetCubeMesh(1.0f);
 
-    while (!a3d::WindowShouldClose()) {
-        a3d::UpdateOrbitCamera(gOrbit);
+    while (!n3d::WindowShouldClose()) {
+        n3d::UpdateOrbitCamera(gOrbit);
 
-        if (a3d::IsKeyPressed(a3d::Key::Space) && beep) a3d::PlaySound(beep);
-        if (a3d::IsKeyPressed(a3d::Key::P) && music) {
-            if (a3d::IsMusicPlaying(music)) a3d::PauseMusic(music);
-            else a3d::ResumeMusic(music);
+        if (n3d::IsKeyPressed(n3d::Key::Space) && beep) n3d::PlaySound(beep);
+        if (n3d::IsKeyPressed(n3d::Key::P) && music) {
+            if (n3d::IsMusicPlaying(music)) n3d::PauseMusic(music);
+            else n3d::ResumeMusic(music);
         }
 
-        a3d::BeginScene(gOrbit.ToCamera(), a3d::Color{0.18f, 0.20f, 0.24f, 1.0f});
-        a3d::DrawGrid(12.0f, 24, a3d::colors::DarkGray);
+        n3d::BeginScene(gOrbit.ToCamera(), n3d::Color{0.18f, 0.20f, 0.24f, 1.0f});
+        n3d::DrawGrid(12.0f, 24, n3d::colors::DarkGray);
 
         if (model) {
-            a3d::DrawModel(model, a3d::Vec3{0.0f, 0.0f, 0.0f}, a3d::Vec3{0.0f, a3d::GetTime() * 20.0f, 0.0f},
-                           a3d::Vec3{1.0f, 1.0f, 1.0f});
+            n3d::DrawModel(model, n3d::Vec3{0.0f, 0.0f, 0.0f}, n3d::Vec3{0.0f, n3d::GetTime() * 20.0f, 0.0f},
+                           n3d::Vec3{1.0f, 1.0f, 1.0f});
         } else {
-            a3d::DrawCube(a3d::Vec3{0.0f, 1.0f, 0.0f}, a3d::Vec3{2.0f, 2.0f, 2.0f},
-                          a3d::colors::Orange);
+            n3d::DrawCube(n3d::Vec3{0.0f, 1.0f, 0.0f}, n3d::Vec3{2.0f, 2.0f, 2.0f},
+                          n3d::colors::Orange);
         }
 
         // A glowing shell around the model, drawn with the rim shader only for
         // this one call. BeginShader/EndShader keep the state change local.
         if (outline) {
-            a3d::BeginShader(outline);
-            a3d::SetBlendMode(a3d::BlendMode::Additive);
-            a3d::SetDepthTest(a3d::DepthTest::LessEqual);
-            a3d::DrawMesh(cube, a3d::Vec3{0.0f, 1.5f, 0.0f}, a3d::Vec3{0.0f, a3d::GetTime() * 40.0f, 0.0f},
-                          a3d::Vec3{2.6f, 2.6f, 2.6f}, a3d::colors::Cyan);
-            a3d::EndShader();
+            n3d::BeginShader(outline);
+            n3d::SetBlendMode(n3d::BlendMode::Additive);
+            n3d::SetDepthTest(n3d::DepthTest::LessEqual);
+            n3d::DrawMesh(cube, n3d::Vec3{0.0f, 1.5f, 0.0f}, n3d::Vec3{0.0f, n3d::GetTime() * 40.0f, 0.0f},
+                          n3d::Vec3{2.6f, 2.6f, 2.6f}, n3d::colors::Cyan);
+            n3d::EndShader();
         }
 
         // HUD.
-        a3d::DrawText("space: beep   p: pause music", 16, 16, 20.0f, a3d::colors::White);
+        n3d::DrawText("space: beep   p: pause music", 16, 16, 20.0f, n3d::colors::White);
         if (music) {
-            a3d::DrawTextFormat(16, 42, 20.0f, a3d::colors::Lime, "music %.1f / %.1f s",
-                                static_cast<double>(a3d::GetMusicTime(music)),
-                                static_cast<double>(a3d::GetMusicLength(music)));
+            n3d::DrawTextFormat(16, 42, 20.0f, n3d::colors::Lime, "music %.1f / %.1f s",
+                                static_cast<double>(n3d::GetMusicTime(music)),
+                                static_cast<double>(n3d::GetMusicLength(music)));
         }
 
-        a3d::EndScene();
+        n3d::EndScene();
     }
 
-    if (music) a3d::UnloadMusic(music);
-    if (beep) a3d::UnloadSound(beep);
-    if (model) a3d::UnloadModel(model);
-    a3d::Close();
+    if (music) n3d::UnloadMusic(music);
+    if (beep) n3d::UnloadSound(beep);
+    if (model) n3d::UnloadModel(model);
+    n3d::Close();
     return 0;
 }

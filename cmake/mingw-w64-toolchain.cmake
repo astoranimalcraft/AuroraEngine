@@ -1,4 +1,4 @@
-# CMake toolchain for cross-compiling Aurora3D from Linux with MinGW-w64.
+# CMake toolchain for cross-compiling NexiumEngine from Linux with MinGW-w64.
 #
 # DirectX 12 is Windows-only, so this is not how you build for release - it exists
 # so that the CMake build itself can be exercised (and the examples linked) on a
