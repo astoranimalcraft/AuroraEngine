@@ -1,14 +1,14 @@
-// Aurora3D — public input queries.
+// NexiumEngine — public input queries.
 //
 // Every function forwards to the Win32 backend, which tracks the current and
 // previous state of each key so "pressed" and "released" are exact one-frame
 // edges rather than a guess based on a timer.
-#include "aurora/input.h"
+#include "nexium/input.h"
 
 #include "internal/gpu.h"
 #include "internal/window.h"
 
-namespace a3d {
+namespace n3d {
 
 bool IsKeyDown(Key key) { return internal::Window::Get().KeyDown(key); }
 bool IsKeyPressed(Key key) { return internal::Window::Get().KeyPressed(key); }
@@ -39,6 +39,7 @@ float GetMouseX() { return internal::Window::Get().MousePosition().x; }
 float GetMouseY() { return internal::Window::Get().MousePosition().y; }
 Vec2 GetMouseDelta() { return internal::Window::Get().MouseDelta(); }
 float GetMouseWheelDelta() { return internal::Window::Get().MouseWheel(); }
+Vec2 GetMouseWheelVector() { return internal::Window::Get().MouseWheelVector(); }
 bool IsMouseInWindow() { return internal::Window::Get().MouseInWindow(); }
 
 void SetMouseCaptured(bool captured) { internal::Window::Get().SetMouseCaptured(captured); }
@@ -47,6 +48,12 @@ void SetMouseVisible(bool visible) { internal::Window::Get().SetMouseVisible(vis
 bool IsMouseVisible() { return internal::Window::Get().MouseVisible(); }
 void SetMousePosition(Vec2 position) { internal::Window::Get().SetMousePosition(position); }
 void SetMouseLockedInWindow(bool locked) { internal::Window::Get().SetMouseLockedInWindow(locked); }
+
+void SetCursorClipped(bool clipped) { internal::Window::Get().SetCursorClipped(clipped); }
+bool IsCursorClipped() { return internal::Window::Get().CursorClipped(); }
+
+void SetMouseCursor(MouseCursor cursor) { internal::Window::Get().SetMouseCursor(cursor); }
+MouseCursor GetMouseCursor() { return internal::Window::Get().CursorShape(); }
 
 Vec2 GetMouseNdc() {
     const Vec2 position = internal::Window::Get().MousePosition();
@@ -58,4 +65,4 @@ Vec2 GetMouseNdc() {
     return Vec2{(position.x / width) * 2.0f - 1.0f, 1.0f - (position.y / height) * 2.0f};
 }
 
-} // namespace a3d
+} // namespace n3d

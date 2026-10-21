@@ -1,12 +1,12 @@
-// Aurora3D — the immediate-mode drawing API.
+// NexiumEngine — the immediate-mode drawing API.
 //
 // Everything here is a thin translation into a Renderer call: convert friendly
 // arguments (euler degrees, sizes, colors) into a world matrix plus material and
 // queue it. Keeping the conversion in one file means the queuing rules — winding,
 // culling, transparency — are stated exactly once.
-#include "aurora/draw.h"
+#include "nexium/draw.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
 #include "internal/gpu.h"
 #include "internal/renderer.h"
@@ -14,10 +14,10 @@
 
 #include <cmath>
 
-namespace a3d {
+namespace n3d {
 namespace {
 
-// Euler degrees to a world matrix, the way a3d::DrawMesh is documented.
+// Euler degrees to a world matrix, the way n3d::DrawMesh is documented.
 Mat4 MakeWorld(Vec3 position, Vec3 rotationDegrees, Vec3 scale) {
     return Compose(position, Vec3{Radians(rotationDegrees.x), Radians(rotationDegrees.y),
                                   Radians(rotationDegrees.z)},
@@ -35,7 +35,7 @@ void DrawPrimitive(const Mesh* mesh, Vec3 position, Vec3 rotationDegrees, Vec3 s
 
 // BeginScene / BeginSceneOverlay / EndScene / GetAspectRatio are defined in
 // engine.cpp, next to the rest of the frame lifecycle. 2D overlay calls such as
-// a3d::DrawScreenRect() are queued here and drawn by EndScene(), so they may be
+// n3d::DrawScreenRect() are queued here and drawn by EndScene(), so they may be
 // issued anywhere between BeginScene() and EndScene().
 
 // --------------------------------------------------------------- meshes ----
@@ -65,29 +65,98 @@ void SetTexture(Texture* texture) {
 
 // ---------------------------------------------------------------- solids ----
 void DrawCube(Vec3 position, Vec3 size, Color color) {
+    // The unit cube spans -0.5..0.5, so the scale is the size itself.
     DrawPrimitive(GetCubeMesh(1.0f), position, Vec3{}, size, color);
 }
 
 void DrawSphere(Vec3 center, float radius, Color color) {
-    DrawPrimitive(GetSphereMesh(1.0f), center, Vec3{}, Vec3{radius * 2.0f, radius * 2.0f,
-                                                             radius * 2.0f},
-                  color);
+    // The mesh is built at the requested radius and drawn unscaled, so the sphere
+    // is exactly as wide as asked. (Scaling a radius-1 mesh by radius * 2, as an
+    // earlier version did, drew it twice the size.)
+    DrawPrimitive(GetSphereMesh(radius), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawSphereEx(Vec3 center, float radius, int rings, int slices, Color color) {
+    DrawPrimitive(GetSphereMesh(radius, rings, slices), center, Vec3{}, Vec3{1, 1, 1}, color);
 }
 
 void DrawCylinder(Vec3 center, float radius, float height, Color color) {
-    DrawPrimitive(GetCylinderMesh(1.0f, 1.0f), center, Vec3{},
-                  Vec3{radius * 2.0f, height, radius * 2.0f}, color);
+    DrawPrimitive(GetCylinderMesh(radius, height), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawCylinderEx(Vec3 start, Vec3 end, float radius, Color color) {
+    const Vec3 axis = end - start;
+    const float length = Length(axis);
+    if (length < 1e-6f) return;
+
+    // The mesh is built along +Y, so rotate +Y onto the segment's direction.
+    const Vec3 up{0.0f, 1.0f, 0.0f};
+    const Vec3 direction = axis / length;
+    Mat4 rotation;
+    const float alignment = Dot(up, direction);
+    if (alignment > 0.99999f) {
+        rotation = Mat4::Identity();
+    } else if (alignment < -0.99999f) {
+        rotation = RotationX(PI);   // pointing straight down
+    } else {
+        rotation = RotationAxis(Cross(up, direction), std::acos(Clamp(alignment, -1.0f, 1.0f)));
+    }
+
+    const Mat4 world = Translation((start + end) * 0.5f) * rotation;
+    internal::Renderer::Get().DrawMesh(GetCylinderMesh(radius, length), world, color,
+                                       GetDefaultTexture(), 0.0f, 0.5f);
 }
 
 void DrawPlane(Vec3 center, Vec2 size, Color color) {
+    // The unit plane is 1x1 in XZ, so the scale is the requested extent.
     DrawPrimitive(GetPlaneMesh(1.0f, 1.0f), center, Vec3{}, Vec3{size.x, 1.0f, size.y}, color);
 }
 
 void DrawCone(Vec3 baseCenter, float radius, float height, Color color) {
     // The cone mesh is built with its base at -height/2, so the centre is offset.
     const Vec3 center{baseCenter.x, baseCenter.y + height * 0.5f, baseCenter.z};
-    DrawPrimitive(GetConeMesh(1.0f, 1.0f), center, Vec3{},
-                  Vec3{radius * 2.0f, height, radius * 2.0f}, color);
+    DrawPrimitive(GetConeMesh(radius, height), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawCapsule(Vec3 center, float radius, float height, Color color) {
+    DrawPrimitive(GetCapsuleMesh(radius, height), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawTorus(Vec3 center, float majorRadius, float minorRadius, Color color) {
+    DrawPrimitive(GetTorusMesh(majorRadius, minorRadius), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawPyramid(Vec3 baseCenter, float baseSize, float height, Color color) {
+    // The pyramid mesh is built with its base at -height/2.
+    const Vec3 center{baseCenter.x, baseCenter.y + height * 0.5f, baseCenter.z};
+    DrawPrimitive(GetPyramidMesh(baseSize, height), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawDisk(Vec3 center, float radius, Color color) {
+    DrawPrimitive(GetDiskMesh(radius), center, Vec3{}, Vec3{1, 1, 1}, color);
+}
+
+void DrawQuad(Vec3 center, Vec2 size, Vec3 normal, Color color) {
+    const float lengthSq = LengthSq(normal);
+    if (lengthSq < 1e-8f) return;
+
+    // A quad is the unit plane oriented so its +Y normal points where the caller
+    // asked, then scaled to the requested extent.
+    const Vec3 target = normal / std::sqrt(lengthSq);
+    const Vec3 up{0.0f, 1.0f, 0.0f};
+    const float alignment = Dot(up, target);
+    Mat4 rotation;
+    if (alignment > 0.99999f) {
+        rotation = Mat4::Identity();
+    } else if (alignment < -0.99999f) {
+        rotation = RotationX(PI);
+    } else {
+        rotation = RotationAxis(Cross(up, target), std::acos(Clamp(alignment, -1.0f, 1.0f)));
+    }
+
+    const Mat4 world = Translation(center) * rotation * Scale(Vec3{size.x, 1.0f, size.y});
+    internal::Renderer::Get().DrawMesh(GetPlaneMesh(1.0f, 1.0f), world, color, GetDefaultTexture(),
+                                       0.0f, 0.5f);
 }
 
 void DrawBox(Bounds bounds, Color color) {
@@ -188,4 +257,4 @@ void DrawScreenRect(Vec2 position, Vec2 size, Color color) {
     internal::Renderer::Get().DrawScreenRect(position, size, color);
 }
 
-} // namespace a3d
+} // namespace n3d

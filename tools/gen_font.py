@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates src/internal/font_data.h — the built-in bitmap font.
 
-The engine ships a tiny ASCII bitmap font so a program can call a3d::DrawText()
+The engine ships a tiny ASCII bitmap font so a program can call n3d::DrawText()
 with no asset files at all. The glyphs are authored here as readable ASCII art
 (7 rows of 5 pixels, '#' = ink) and packed into one byte per row, low 5 bits,
 most-significant bit leftmost.
@@ -823,7 +823,7 @@ def main():
         rows.extend(parse_art(char, GLYPHS[char]))
 
     lines = [
-        "// Aurora3D — generated file. DO NOT EDIT.",
+        "// NexiumEngine — generated file. DO NOT EDIT.",
         "//",
         "// Regenerate with:  python3 tools/gen_font.py",
         "//",
@@ -833,7 +833,7 @@ def main():
         "",
         "#include <cstdint>",
         "",
-        "namespace a3d::internal {",
+        "namespace n3d::internal {",
         "",
         f"inline constexpr int kFontGlyphWidth = {GLYPH_W};",
         f"inline constexpr int kFontGlyphHeight = {GLYPH_H};",
@@ -851,7 +851,7 @@ def main():
         lines.append(f"    {values}, // {label!r}")
     lines.append("};")
     lines.append("")
-    lines.append("} // namespace a3d::internal")
+    lines.append("} // namespace n3d::internal")
     lines.append("")
 
     directory = os.path.dirname(output)

@@ -1,15 +1,38 @@
-// Aurora3D — camera.cpp
+// NexiumEngine — camera.cpp
 // The orbit controller needs input and frame time, which live in other headers,
 // so it is implemented here rather than inline in camera.h. Keeping it in the
 // library means an example does not have to re-derive the same camera maths.
-#include "aurora/camera.h"
+#include "nexium/camera.h"
 
-#include "aurora/aurora.h"   // GetFrameTime()
-#include "aurora/input.h"
+#include "nexium/NexiumEngine.h"   // GetFrameTime()
+#include "nexium/input.h"
 
 #include <cmath>
 
-namespace a3d {
+namespace n3d {
+
+void UpdateFpsCamera(FpsCamera& camera, MouseButton lookButton) {
+    // The mouse looks around either while `lookButton` is held or whenever the
+    // cursor is captured, which is the usual arrangement in a shooter: dragging is
+    // for a windowed editor, capture is for play.
+    if (IsMouseButtonDown(lookButton) || IsMouseCaptured()) camera.Look(GetMouseDelta());
+
+    const float deltaTime = GetFrameTime();
+    const float speedScale = deltaTime;
+
+    // Walk in the horizontal plane, then fly with Space/Ctrl.
+    Vec2 walk{};
+    if (IsKeyDown(Key::W)) walk.y += 1.0f;
+    if (IsKeyDown(Key::S)) walk.y -= 1.0f;
+    if (IsKeyDown(Key::D)) walk.x += 1.0f;
+    if (IsKeyDown(Key::A)) walk.x -= 1.0f;
+    if (walk.x != 0.0f || walk.y != 0.0f) camera.Walk(walk, speedScale);
+
+    float rise = 0.0f;
+    if (IsKeyDown(Key::Space)) rise += 1.0f;
+    if (IsKeyDown(Key::LeftControl) || IsKeyDown(Key::C)) rise -= 1.0f;
+    if (rise != 0.0f) camera.position.y += rise * camera.moveSpeed * speedScale;
+}
 
 void UpdateOrbitCamera(OrbitCamera& camera, MouseButton rotateButton) {
     if (IsMouseButtonDown(rotateButton)) {
@@ -45,4 +68,4 @@ void UpdateOrbitCamera(OrbitCamera& camera, MouseButton rotateButton) {
     camera.target = camera.target + (forwardAxis * forward + rightAxis * right) * speed;
 }
 
-} // namespace a3d
+} // namespace n3d

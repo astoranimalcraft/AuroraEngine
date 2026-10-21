@@ -1,12 +1,12 @@
-// Aurora3D — mesh creation, GPU upload and built-in primitives.
+// NexiumEngine — mesh creation, GPU upload and built-in primitives.
 //
 // Geometry is uploaded into DEFAULT-heap buffers through a staging copy, so draw
 // calls read from fast memory. Primitives are built once, cached by their
 // parameters and shared; they carry MeshBuiltin in `flags` so UnloadMesh() can
 // refuse to free them.
-#include "aurora/mesh.h"
+#include "nexium/mesh.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
 #include "internal/gpu.h"
 #include "internal/geometry.h"
@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 namespace {
 
 std::mutex gMeshMutex;
@@ -124,7 +124,7 @@ Mesh* CreateMeshInternal(const MeshDesc& desc, bool builtin) {
     ComputeBounds(mesh, desc.vertices, desc.vertexCount);
 
     const uint64_t vertexBytes = static_cast<uint64_t>(desc.vertexCount) * sizeof(Vertex);
-    if (!UploadBuffer(desc.vertices, vertexBytes, L"Aurora3D Mesh VB",
+    if (!UploadBuffer(desc.vertices, vertexBytes, L"NexiumEngine Mesh VB",
                       D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, &mesh->vertexBuffer)) {
         delete mesh;
         return nullptr;
@@ -132,7 +132,7 @@ Mesh* CreateMeshInternal(const MeshDesc& desc, bool builtin) {
 
     if (desc.indices && desc.indexCount > 0) {
         const uint64_t indexBytes = static_cast<uint64_t>(desc.indexCount) * sizeof(uint32_t);
-        if (!UploadBuffer(desc.indices, indexBytes, L"Aurora3D Mesh IB",
+        if (!UploadBuffer(desc.indices, indexBytes, L"NexiumEngine Mesh IB",
                           D3D12_RESOURCE_STATE_INDEX_BUFFER, &mesh->indexBuffer)) {
             delete mesh;
             return nullptr;
@@ -229,4 +229,30 @@ Mesh* GetPlaneMesh(float width, float depth, int subdivisions) {
         [=](auto& v, auto& i) { geometry::BuildPlane(v, i, width, depth, subdivisions); });
 }
 
-} // namespace a3d
+Mesh* GetTorusMesh(float majorRadius, float minorRadius, int majorSegments, int minorSegments) {
+    return GetOrBuildPrimitive(
+        PrimitiveKey("torus", majorRadius, minorRadius, majorSegments, minorSegments),
+        [=](auto& v, auto& i) {
+            geometry::BuildTorus(v, i, majorRadius, minorRadius, majorSegments, minorSegments);
+        });
+}
+
+Mesh* GetPyramidMesh(float baseSize, float height) {
+    return GetOrBuildPrimitive(
+        PrimitiveKey("pyramid", baseSize, height, 0, 0),
+        [=](auto& v, auto& i) { geometry::BuildPyramid(v, i, baseSize, height); });
+}
+
+Mesh* GetDiskMesh(float radius, int segments) {
+    return GetOrBuildPrimitive(
+        PrimitiveKey("disk", radius, 0, segments, 0),
+        [=](auto& v, auto& i) { geometry::BuildDisk(v, i, radius, segments); });
+}
+
+Mesh* GetCapsuleMesh(float radius, float height, int slices, int rings) {
+    return GetOrBuildPrimitive(
+        PrimitiveKey("capsule", radius, height, slices, rings),
+        [=](auto& v, auto& i) { geometry::BuildCapsule(v, i, radius, height, slices, rings); });
+}
+
+} // namespace n3d

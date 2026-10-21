@@ -1,18 +1,18 @@
-// Aurora3D — model loading.
+// NexiumEngine — model loading.
 //
 // Two backends sit behind one API:
 //
 //   * the built-in Wavefront OBJ/MTL loader, always available and dependency
 //     free, which handles the common case (v/vn/vt/f, usemtl, map_Kd) including
 //     negative indices and polygons of any size;
-//   * an optional Assimp backend compiled in with AURORA_HAS_ASSIMP, which adds
+//   * an optional Assimp backend compiled in with NEXIUM_HAS_ASSIMP, which adds
 //     FBX, glTF, DAE and the rest. When it is present it is used for every
 //     extension other than .obj, and the OBJ loader keeps handling .obj so
 //     behaviour does not change based on the build.
-#include "aurora/model.h"
+#include "nexium/model.h"
 
-#include "aurora/draw.h"
-#include "aurora/log.h"
+#include "nexium/draw.h"
+#include "nexium/log.h"
 
 #include "internal/renderer.h"
 
@@ -21,13 +21,13 @@
 #include <string>
 #include <vector>
 
-#if defined(AURORA_HAS_ASSIMP)
+#if defined(NEXIUM_HAS_ASSIMP)
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #endif
 
-namespace a3d {
+namespace n3d {
 
 namespace {
 
@@ -341,7 +341,7 @@ bool LoadObj(const char* path, Model* model) {
 
 } // namespace obj
 
-#if defined(AURORA_HAS_ASSIMP)
+#if defined(NEXIUM_HAS_ASSIMP)
 namespace assimp_backend {
 
 bool LoadWithAssimp(const char* path, Model* model) {
@@ -435,10 +435,10 @@ Model* LoadModel(const char* path) {
     if (extension == "obj") {
         ok = obj::LoadObj(path, model);
     } else {
-#if defined(AURORA_HAS_ASSIMP)
+#if defined(NEXIUM_HAS_ASSIMP)
         ok = assimp_backend::LoadWithAssimp(path, model);
 #else
-        LogError("model: '.%s' needs the Assimp backend (build with AURORA_HAS_ASSIMP)",
+        LogError("model: '.%s' needs the Assimp backend (build with NEXIUM_HAS_ASSIMP)",
                  extension.c_str());
 #endif
     }
@@ -515,4 +515,4 @@ Bounds ModelWorldBounds(const Model* model, Vec3 position, Vec3 rotationDegrees,
     return result;
 }
 
-} // namespace a3d
+} // namespace n3d

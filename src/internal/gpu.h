@@ -1,4 +1,4 @@
-// Aurora3D — GPU context (internal).
+// NexiumEngine — GPU context (internal).
 //
 // Owns everything that is a singleton on the device: the D3D12 device, the direct
 // command queue, the swap chain and its back buffers, the depth buffer, the
@@ -16,8 +16,8 @@
 // duplicated per slot and only touched after that slot's fence has signalled.
 #pragma once
 
-#include "aurora/color.h"
-#include "aurora/math.h"
+#include "nexium/color.h"
+#include "nexium/math.h"
 
 #include "internal/common.h"
 
@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace a3d::internal {
+namespace n3d::internal {
 
 // A persistently-mapped upload-heap buffer used for per-frame dynamic geometry.
 struct DynamicBuffer {
@@ -54,6 +54,10 @@ struct FrameResources {
     ComPtr<ID3D12GraphicsCommandList> commandList;
     DynamicBuffer vertices;
     DynamicBuffer indices;
+    // Upload-heap storage for the per-frame shadow constant block. One copy per
+    // frame slot, because the CPU may be several frames ahead of the GPU and a
+    // single shared buffer would be overwritten while still in flight.
+    DynamicBuffer shadowConstants;
     uint64_t fenceValue = 0;
 };
 
@@ -72,7 +76,7 @@ public:
     void EndFrame();
 
     // Present interval and tearing flag for the swap chain. Set from
-    // a3d::SetVsync(); 1 blocks on the vertical blank, 0 presents immediately.
+    // n3d::SetVsync(); 1 blocks on the vertical blank, 0 presents immediately.
     void SetVsync(bool enabled) { vsync_ = enabled; }
     bool Vsync() const { return vsync_; }
 
@@ -102,6 +106,26 @@ public:
 
     // Blocks until every in-flight frame has finished on the GPU.
     void WaitForIdle();
+
+    // ---- shadow map ---------------------------------------------------------
+    // A single depth-only target reused every frame. Created lazily on the first
+    // shadow pass so a program that never enables shadows pays nothing for it.
+    bool EnsureShadowMap(uint32_t size);
+    ID3D12Resource* ShadowMap() const { return shadowMap_.Get(); }
+    uint32_t ShadowMapSize() const { return shadowMapSize_; }
+    D3D12_GPU_DESCRIPTOR_HANDLE ShadowMapSrv() const { return shadowMapSrv_; }
+    D3D12_CPU_DESCRIPTOR_HANDLE ShadowMapDsv() const { return shadowMapDsv_; }
+    // Writes the per-frame shadow constants into this frame's upload slot and
+    // returns the GPU address, for a root CBV.
+    D3D12_GPU_VIRTUAL_ADDRESS PushShadowConstants(const ShadowConstants& constants);
+    // Opens the shadow pass: depth-only, no colour target, viewport set to the map.
+    void BeginShadowPass();
+    // Restores the swap chain's render target and the scene viewport.
+    void EndShadowPass();
+    // True while the shadow pass is open, so the renderer can skip queuing.
+    bool InShadowPass() const { return inShadowPass_; }
+    // Frees the shadow resources on teardown.
+    void DestroyShadowMap();
 
     // One-shot command list for resource uploads performed outside a frame
     // (textures, meshes). BeginImmediate() resets a dedicated allocator and
@@ -168,6 +192,7 @@ private:
     uint32_t frameIndex_ = 0;
     uint32_t srvIncrement_ = 0;
     uint32_t rtvIncrement_ = 0;
+    uint32_t dsvIncrement_ = 0;
 
     // SRV slots are bump-allocated and recycled through a free list, so a slot
     // stays valid for the lifetime of the resource that owns it.
@@ -196,6 +221,18 @@ private:
     bool vsync_ = true;
     bool tearingSupported_ = false;
     std::string adapterName_;
+
+    // Shadow map: one depth target, its DSV and its SRV. Allocated on first use.
+    ComPtr<ID3D12Resource> shadowMap_;
+    D3D12_CPU_DESCRIPTOR_HANDLE shadowMapDsv_{};
+    D3D12_GPU_DESCRIPTOR_HANDLE shadowMapSrv_{};
+    D3D12_CPU_DESCRIPTOR_HANDLE shadowMapSrvCpu_{};
+    uint32_t shadowMapSize_ = 0;
+    // The shadow map's current resource state. It alternates between depth-write
+    // (during the pass) and shader-read (the rest of the frame), so a barrier has to
+    // name the right StateBefore; a freshly created map is already depth-write.
+    D3D12_RESOURCE_STATES shadowMapState_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bool inShadowPass_ = false;
 };
 
-} // namespace a3d::internal
+} // namespace n3d::internal

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates src/internal/shader_sources.h from the .hlsl files in shaders/.
 
-The engine embeds its own shaders so a program links against Aurora3D and runs
+The engine embeds its own shaders so a program links against NexiumEngine and runs
 with no asset files next to the executable. The .hlsl files stay on disk because
 they are the readable, editable source of truth (and the reference users copy
 when writing custom shaders); this script turns them into string literals.
@@ -19,8 +19,9 @@ import sys
 SHADER_DIR = "shaders"
 OUTPUT = os.path.join("src", "internal", "shader_sources.h")
 
-# Embedded in this order; the include handler resolves "aurora.hlsli" from here.
-FILES = ["aurora.hlsli", "aurora_basic.hlsl", "aurora_line.hlsl", "aurora_text.hlsl"]
+# Embedded in this order; the include handler resolves "nexium.hlsli" from here.
+FILES = ["nexium.hlsli", "nexium_basic.hlsl", "nexium_line.hlsl", "nexium_text.hlsl",
+         "nexium_sky.hlsl"]
 
 
 def identifier(name):
@@ -53,23 +54,23 @@ def main():
             source = handle.read()
 
         # A raw string literal cannot contain its own delimiter sequence.
-        if ")A3D" in source:
-            print(f"error: {path} contains the raw-string delimiter )A3D", file=sys.stderr)
+        if ")N3D" in source:
+            print(f"error: {path} contains the raw-string delimiter )N3D", file=sys.stderr)
             return 1
         entries.append((os.path.basename(path), source))
 
     lines = [
-        "// Aurora3D — generated file. DO NOT EDIT.",
+        "// NexiumEngine — generated file. DO NOT EDIT.",
         "//",
         "// Regenerate with:  python3 tools/embed_shaders.py",
         "//",
         "// The engine compiles these copies of shaders/*.hlsl at startup so that an",
-        "// Aurora3D program runs with no shader files next to the executable. Files on",
+        "// NexiumEngine program runs with no shader files next to the executable. Files on",
         "// disk take precedence, so dropping a modified copy beside the binary (or",
         "// pointing LoadShader() at your own) overrides the built-in one.",
         "#pragma once",
         "",
-        "namespace a3d::internal {",
+        "namespace n3d::internal {",
         "",
         "struct EmbeddedShader {",
         "    const char* name;",
@@ -80,7 +81,7 @@ def main():
 
     for name, source in entries:
         lines.append(
-            f'inline constexpr const char* kShaderSource_{identifier(name)} = R"A3D({source})A3D";'
+            f'inline constexpr const char* kShaderSource_{identifier(name)} = R"N3D({source})N3D";'
         )
         lines.append("")
 
@@ -105,7 +106,7 @@ def main():
     lines.append("    return nullptr;")
     lines.append("}")
     lines.append("")
-    lines.append("} // namespace a3d::internal")
+    lines.append("} // namespace n3d::internal")
     lines.append("")
 
     directory = os.path.dirname(output)

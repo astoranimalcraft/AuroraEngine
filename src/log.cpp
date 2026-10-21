@@ -1,5 +1,5 @@
-// Aurora3D — log.cpp
-#include "aurora/log.h"
+// NexiumEngine — log.cpp
+#include "nexium/log.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -10,7 +10,7 @@
 #endif
 #include <windows.h>
 
-namespace a3d {
+namespace n3d {
 namespace {
 
 LogSink gSink = nullptr;
@@ -30,7 +30,7 @@ const char* LevelName(LogLevel level) {
 
 void DefaultSink(LogLevel level, const char* message) {
     char line[2048];
-    std::snprintf(line, sizeof(line), "[aurora] %s %s\n", LevelName(level), message);
+    std::snprintf(line, sizeof(line), "[nexium] %s %s\n", LevelName(level), message);
     OutputDebugStringA(line);
     if (GetConsoleWindow() != nullptr) {
         std::fputs(line, stderr);
@@ -55,7 +55,7 @@ void LogMessage(LogLevel level, const char* fmt, ...) {
     (gSink ? gSink : DefaultSink)(level, buffer);
 }
 
-#define A3D_DEFINE_LOG_FN(name, level)              \
+#define N3D_DEFINE_LOG_FN(name, level)              \
     void name(const char* fmt, ...) {               \
         if (level < gMinLevel) return;              \
         char buffer[4096];                          \
@@ -66,12 +66,12 @@ void LogMessage(LogLevel level, const char* fmt, ...) {
         LogMessage(level, "%s", buffer);            \
     }
 
-A3D_DEFINE_LOG_FN(LogTrace, LogLevel::Trace)
-A3D_DEFINE_LOG_FN(LogDebug, LogLevel::Debug)
-A3D_DEFINE_LOG_FN(LogInfo,  LogLevel::Info)
-A3D_DEFINE_LOG_FN(LogWarn,  LogLevel::Warn)
-A3D_DEFINE_LOG_FN(LogError, LogLevel::Error)
+N3D_DEFINE_LOG_FN(LogTrace, LogLevel::Trace)
+N3D_DEFINE_LOG_FN(LogDebug, LogLevel::Debug)
+N3D_DEFINE_LOG_FN(LogInfo,  LogLevel::Info)
+N3D_DEFINE_LOG_FN(LogWarn,  LogLevel::Warn)
+N3D_DEFINE_LOG_FN(LogError, LogLevel::Error)
 
-#undef A3D_DEFINE_LOG_FN
+#undef N3D_DEFINE_LOG_FN
 
-} // namespace a3d
+} // namespace n3d

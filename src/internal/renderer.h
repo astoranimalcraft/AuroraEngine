@@ -1,6 +1,6 @@
-// Aurora3D — renderer (internal).
+// NexiumEngine — renderer (internal).
 //
-// Immediate-mode calls (a3d::DrawMesh, a3d::DrawLine, ...) never touch the GPU
+// Immediate-mode calls (n3d::DrawMesh, n3d::DrawLine, ...) never touch the GPU
 // directly. They append to per-frame lists which EndScene() flushes in ordered
 // passes:
 //
@@ -15,12 +15,12 @@
 // so a DrawItem only ever needs a GPU address plus counts.
 #pragma once
 
-#include "aurora/camera.h"
-#include "aurora/color.h"
-#include "aurora/math.h"
-#include "aurora/mesh.h"
-#include "aurora/shader.h"
-#include "aurora/texture.h"
+#include "nexium/camera.h"
+#include "nexium/color.h"
+#include "nexium/math.h"
+#include "nexium/mesh.h"
+#include "nexium/shader.h"
+#include "nexium/texture.h"
 
 #include "internal/common.h"
 
@@ -28,7 +28,7 @@
 
 #include <vector>
 
-namespace a3d::internal {
+namespace n3d::internal {
 
 struct FrameStats {
     uint32_t drawCalls = 0;
@@ -51,7 +51,7 @@ public:
                   float metallic, float roughness);
 
     // Texture used by the next mesh draw that does not name one; cleared once
-    // consumed. This is what a3d::SetTexture() drives.
+    // consumed. This is what n3d::SetTexture() drives.
     void SetPendingTexture(Texture* texture) { pendingTexture_ = texture; }
 
     void DrawLine(Vec3 from, Vec3 to, Color color);
@@ -78,6 +78,28 @@ public:
 
     void SetLightDirection(Vec3 direction);
     void SetAmbient(Color color, float strength);
+
+    // ---- environment -------------------------------------------------------
+    void SetSky(Texture* sky) { skyTexture_ = sky; }
+    Texture* Sky() const { return skyTexture_; }
+    void SetSkyTint(Color tint) { skyTint_ = tint; }
+    // Draws the sky immediately. Called from within the scene so the depth buffer
+    // is already available and the sky is occluded by real geometry.
+    void DrawSky();
+
+    // ---- shadows -----------------------------------------------------------
+    void SetShadowsEnabled(bool enabled) { shadowsEnabled_ = enabled; }
+    bool ShadowsEnabled() const { return shadowsEnabled_; }
+    void SetShadowResolution(uint32_t resolution);
+    uint32_t ShadowResolution() const { return shadowResolution_; }
+    void SetShadowDistance(float distance) { shadowDistance_ = distance > 0.0f ? distance : 1.0f; }
+    float ShadowDistance() const { return shadowDistance_; }
+    void SetShadowBias(float depthBias, float normalBias) {
+        shadowDepthBias_ = depthBias;
+        shadowNormalBias_ = normalBias;
+    }
+    float ShadowDepthBias() const { return shadowDepthBias_; }
+    float ShadowNormalBias() const { return shadowNormalBias_; }
 
     bool InScene() const { return inScene_; }
     const Camera3D& Camera() const { return camera_; }
@@ -135,8 +157,37 @@ private:
     void Issue(const DrawItem& item);
     void BindFrame(const Mat4& viewProj);
 
+    // Renders the opaque queue again from the light's point of view, into the
+    // shadow map, and records whether the result is usable by the main pass.
+    void RenderShadowPass();
+    // Pushes a shadow block with `enabled` at zero, so the shader's shadow lookup
+    // short-circuits on a frame that has no shadow pass.
+    void PushDisabledShadowConstants();
+    // Fits an orthographic box around the camera so the map covers the visible
+    // area. The box follows the camera but is snapped to texel-sized steps, which
+    // stops the shadow edges from crawling as the camera moves.
+    Mat4 ComputeLightViewProj(Vec3 eye, float halfExtent, float* outTexelSize) const;
+
     Camera3D camera_{};
     FrameConstants frameConstants_{};
+
+    bool shadowsEnabled_ = false;
+    uint32_t shadowResolution_ = 2048;
+    float shadowDistance_ = 40.0f;
+    float shadowDepthBias_ = 0.0015f;
+    float shadowNormalBias_ = 0.02f;
+
+    Texture* skyTexture_ = nullptr;
+    Color skyTint_{1, 1, 1, 1};
+    // The built-in sky shader, compiled lazily on the first DrawSky() so a program
+    // that never draws a sky never pays for it.
+    Shader* skyShader_ = nullptr;
+
+    // Set by the shadow pass and consumed by the main pass, so both agree on the
+    // light matrix and on whether the map holds anything worth sampling.
+    Mat4 shadowViewProj_ = Mat4::Identity();
+    bool shadowActive_ = false;
+    D3D12_GPU_VIRTUAL_ADDRESS shadowConstantAddress_ = 0;
 
     std::vector<DrawItem> opaque_;
     std::vector<DrawItem> transparent_;
@@ -184,4 +235,4 @@ private:
     Texture* pendingTexture_ = nullptr;
 };
 
-} // namespace a3d::internal
+} // namespace n3d::internal

@@ -1,13 +1,13 @@
-// Aurora3D — XInput gamepad backend.
+// NexiumEngine — XInput gamepad backend.
 //
 // Controllers are polled once per frame into a small snapshot per slot, so the
 // public queries are cheap and the pressed/released edges are computed the same
 // way the keyboard's are. XInput can be absent at runtime (an old Windows without
 // the redistributable), so every entry point degrades to "no controller" instead
 // of failing to load.
-#include "aurora/input.h"
+#include "nexium/input.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
 #include "internal/common.h"
 
@@ -18,7 +18,7 @@
 #include <cstdio>
 #include <string>
 
-namespace a3d {
+namespace n3d {
 namespace {
 
 // One slot's worth of state: the raw XInput snapshot plus the previous frame's
@@ -169,4 +169,4 @@ void SetGamepadVibration(float leftMotor, float rightMotor, int gamepad) {
     XInputSetState(static_cast<DWORD>(gamepad), &vibration);
 }
 
-} // namespace a3d
+} // namespace n3d

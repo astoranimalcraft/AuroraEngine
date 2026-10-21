@@ -1,4 +1,4 @@
-// Aurora3D — generated file. DO NOT EDIT.
+// NexiumEngine — generated file. DO NOT EDIT.
 //
 // Regenerate with:  python3 tools/gen_font.py
 //
@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace a3d::internal {
+namespace n3d::internal {
 
 inline constexpr int kFontGlyphWidth = 5;
 inline constexpr int kFontGlyphHeight = 7;
@@ -113,4 +113,4 @@ inline constexpr uint8_t kFontRows[] = {
     0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00, // '~'
 };
 
-} // namespace a3d::internal
+} // namespace n3d::internal

@@ -1,4 +1,4 @@
-// Aurora3D — audio backend (XAudio2).
+// NexiumEngine — audio backend (XAudio2).
 //
 // Sound and Music share one decode path: a RIFF/WAVE file is parsed and its PCM
 // payload is handed to XAudio2 as a single buffer in its native format (8/16/24/
@@ -12,9 +12,9 @@
 // The whole subsystem is optional at runtime. XAudio2Create() can fail on a
 // machine with no audio endpoint, and every entry point below tolerates that by
 // reporting silence rather than aborting the program.
-#include "aurora/audio.h"
+#include "nexium/audio.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
 #include "internal/common.h"
 
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 
 // The public headers keep these opaque; the definitions live here because only
 // this file touches XAudio2.
@@ -47,12 +47,15 @@ struct Music {
     WAVEFORMATEX format{};
     float volume = 1.0f;
     float pitch = 1.0f;
+    float pan = 0.0f;
     bool looping = false;
     std::string name;
     uint64_t framesPerSecond = 0;
     // Frame count the current playback started from, so a restart can be detected.
     uint64_t startFrames = 0;
     uint64_t playedFrames = 0;
+    // Frame the current buffer starts at, so a seek can be reported back.
+    uint64_t baseFrames = 0;
 };
 
 namespace {
@@ -219,6 +222,17 @@ void ApplyVolume(IXAudio2SourceVoice* voice, float volume) {
 
 void ApplyPitch(IXAudio2SourceVoice* voice, float pitch) {
     if (voice) voice->SetFrequencyRatio(Clamp(pitch, 0.05f, 8.0f));
+}
+
+// Applies a stereo pan through the voice's output matrix. Only mono and stereo
+// sources can be placed; anything wider is left alone.
+void ApplyPan(IXAudio2SourceVoice* voice, const WAVEFORMATEX& format, float pan) {
+    if (!voice) return;
+    const int channels = format.nChannels;
+    if (channels < 1 || channels > 2) return;
+    const float p = Clamp(pan, -1.0f, 1.0f);
+    float matrix[4] = {(1.0f - p) * 0.5f, (1.0f + p) * 0.5f, 0.0f, 1.0f};
+    voice->SetOutputMatrix(nullptr, static_cast<UINT32>(channels), 2, matrix);
 }
 
 bool VoicePlaying(IXAudio2SourceVoice* voice) {
@@ -391,16 +405,7 @@ float GetSoundPitch(const Sound* sound) { return sound ? sound->pitch : 1.0f; }
 void SetSoundPan(Sound* sound, float pan) {
     if (!sound || !sound->voice) return;
     sound->pan = Clamp(pan, -1.0f, 1.0f);
-
-    // XAudio2 pans through an output matrix. Only mono and stereo sources are
-    // handled; anything wider is left alone.
-    const int channels = sound->format.nChannels;
-    if (channels < 1 || channels > 2) return;
-    float matrix[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-    const float p = sound->pan;
-    matrix[0] = (1.0f - p) * 0.5f;   // left input -> left output
-    matrix[1] = (1.0f + p) * 0.5f;   // left input -> right output
-    sound->voice->SetOutputMatrix(nullptr, static_cast<UINT32>(channels), 2, matrix);
+    ApplyPan(sound->voice, sound->format, sound->pan);
 }
 
 bool IsSoundLooping(const Sound* sound) { return sound && sound->looping; }
@@ -453,27 +458,49 @@ void UnloadMusic(Music* music) {
     delete music;
 }
 
-void PlayMusic(Music* music) {
-    if (!music || !music->voice) return;
+namespace {
+
+// Submits the music's PCM starting at `startFrame` and starts the voice. Used by
+// PlayMusic() (frame 0) and SeekMusic() (any frame).
+void SubmitMusicFrom(Music* music, uint64_t startFrame) {
     music->voice->Stop(0);
     music->voice->FlushSourceBuffers();
 
+    const uint32_t blockAlign = music->format.nBlockAlign;
+    const uint64_t totalFrames = blockAlign ? music->pcm.size() / blockAlign : 0;
+    if (startFrame >= totalFrames) {
+        music->baseFrames = 0;
+        music->startFrames = 0;
+        music->playedFrames = 0;
+        return;
+    }
+
     XAUDIO2_BUFFER buffer{};
-    buffer.AudioBytes = static_cast<UINT32>(music->pcm.size());
-    buffer.pAudioData = music->pcm.data();
+    buffer.AudioBytes = static_cast<UINT32>(music->pcm.size() - startFrame * blockAlign);
+    buffer.pAudioData = music->pcm.data() + startFrame * blockAlign;
     buffer.Flags = XAUDIO2_END_OF_STREAM;
     buffer.LoopCount = music->looping ? XAUDIO2_LOOP_INFINITE : 0;
     if (FAILED(music->voice->SubmitSourceBuffer(&buffer))) return;
 
+    music->baseFrames = startFrame;
     music->startFrames = 0;
     music->playedFrames = 0;
     music->voice->Start(0);
+}
+
+} // namespace
+
+void PlayMusic(Music* music) {
+    if (!music || !music->voice) return;
+    // A plain play restarts from the top; SeekMusic() submits a sub-buffer instead.
+    SubmitMusicFrom(music, 0);
 }
 
 void StopMusic(Music* music) {
     if (!music || !music->voice) return;
     music->voice->Stop(0);
     music->voice->FlushSourceBuffers();
+    music->baseFrames = 0;
     music->playedFrames = 0;
 }
 
@@ -503,9 +530,21 @@ void SetMusicPitch(Music* music, float pitch) {
     ApplyPitch(music->voice, pitch);
 }
 
+float GetMusicPitch(const Music* music) { return music ? music->pitch : 1.0f; }
+
+void SetMusicPan(Music* music, float pan) {
+    if (!music || !music->voice) return;
+    music->pan = Clamp(pan, -1.0f, 1.0f);
+    ApplyPan(music->voice, music->format, music->pan);
+}
+
+float GetMusicPan(const Music* music) { return music ? music->pan : 0.0f; }
+
 void SetMusicLooping(Music* music, bool looping) {
     if (music) music->looping = looping;
 }
+
+bool IsMusicLooping(const Music* music) { return music && music->looping; }
 
 float GetMusicLength(const Music* music) {
     if (!music || music->format.nAvgBytesPerSec == 0) return 0.0f;
@@ -523,18 +562,25 @@ float GetMusicTime(Music* music) {
         music->startFrames = 0;
     }
     music->playedFrames = state.SamplesPlayed - music->startFrames;
-    return static_cast<float>(music->playedFrames) /
-           static_cast<float>(music->framesPerSecond);
+    // The submitted buffer may start partway in (after a seek), so add its base.
+    const uint64_t frames = music->baseFrames + music->playedFrames;
+    return static_cast<float>(frames) / static_cast<float>(music->framesPerSecond);
 }
 
 void SeekMusic(Music* music, float seconds) {
-    // A single submitted buffer cannot be seeked, so restart. The reported time
-    // then starts from zero; sample-accurate seeking would need a chunked stream.
-    if (!music) return;
-    (void)seconds;
-    PlayMusic(music);
+    if (!music || !music->voice || music->framesPerSecond == 0) return;
+
+    const bool wasPlaying = IsMusicPlaying(music);
+    if (seconds < 0.0f) seconds = 0.0f;
+
+    // Convert to a frame index, clamped to the track, then resubmit from there.
+    const uint64_t frame = static_cast<uint64_t>(seconds * static_cast<float>(music->framesPerSecond));
+    SubmitMusicFrom(music, frame);
+
+    // Seeking a paused track should leave it paused.
+    if (!wasPlaying) music->voice->Stop(0);
 }
 
 void UpdateMusic() { ReapMultiVoices(); }
 
-} // namespace a3d
+} // namespace n3d

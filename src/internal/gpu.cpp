@@ -1,14 +1,14 @@
-// Aurora3D — GPU context implementation.
+// NexiumEngine — GPU context implementation.
 #include "internal/gpu.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
 
 #include <cstdio>
 
-namespace a3d::internal {
+namespace n3d::internal {
 namespace {
 
 constexpr D3D_FEATURE_LEVEL kMinFeatureLevel = D3D_FEATURE_LEVEL_11_0;
@@ -151,7 +151,7 @@ bool GpuContext::Initialize(HWND hwnd, uint32_t width, uint32_t height, bool ena
     }
     immediateList_->Close();
 
-    LogInfo("Aurora3D ready — %ux%u, %s", width_, height_, adapterName_.c_str());
+    LogInfo("NexiumEngine ready — %ux%u, %s", width_, height_, adapterName_.c_str());
     return true;
 }
 
@@ -302,6 +302,7 @@ bool GpuContext::CreateDescriptorHeaps() {
 
     srvIncrement_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     rtvIncrement_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    dsvIncrement_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     return true;
 }
 
@@ -342,7 +343,7 @@ bool GpuContext::CreateDepthBuffer() {
         LogError("failed to create depth buffer");
         return false;
     }
-    depthBuffer_->SetName(L"Aurora3D Depth Buffer");
+    depthBuffer_->SetName(L"NexiumEngine Depth Buffer");
 
     D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
     dsv.Format = DXGI_FORMAT_D32_FLOAT;
@@ -369,8 +370,12 @@ bool GpuContext::CreateFrameResources() {
         }
         frame.commandList->Close();
 
-        if (!frame.vertices.Create(device_.Get(), 4ull * 1024 * 1024, L"Aurora3D Vertices")) return false;
-        if (!frame.indices.Create(device_.Get(), 4ull * 1024 * 1024, L"Aurora3D Indices")) return false;
+        if (!frame.vertices.Create(device_.Get(), 4ull * 1024 * 1024, L"NexiumEngine Vertices")) return false;
+        if (!frame.indices.Create(device_.Get(), 4ull * 1024 * 1024, L"NexiumEngine Indices")) return false;
+        // Only a handful of shadow constant blocks per frame, so a small buffer is
+        // plenty; it exists so the block never has to be inlined in the root
+        // signature, where its 24 DWORDs would blow the 64-DWORD budget.
+        if (!frame.shadowConstants.Create(device_.Get(), 64ull * 1024, L"NexiumEngine Shadow Constants")) return false;
     }
     return true;
 }
@@ -425,6 +430,7 @@ bool GpuContext::BeginFrame(Color clearColor, bool clearColorBuffer, bool clearD
 
     frame.vertices.offset = 0;
     frame.indices.offset = 0;
+    frame.shadowConstants.offset = 0;
 
     const uint32_t backBufferIndex = swapChain_->GetCurrentBackBufferIndex();
 
@@ -515,6 +521,170 @@ void GpuContext::WaitForIdle() {
     // staging buffers and meshes queued since the last EndFrame() would only be
     // reclaimed if another frame is drawn.
     SweepDeferredActions();
+}
+
+// ----------------------------------------------------------------- shadows ---
+
+bool GpuContext::EnsureShadowMap(uint32_t size) {
+    if (size == 0) return false;
+    if (shadowMap_ && shadowMapSize_ == size) return true;
+
+    if (!device_) return false;
+
+    // Replacing the map means the old one may still be referenced by a command
+    // list in flight, so drain the queue first.
+    if (shadowMap_) {
+        WaitForIdle();
+        shadowMap_.Reset();
+        FreeSrv(shadowMapSrvCpu_);
+        shadowMapSrv_ = {};
+        shadowMapSrvCpu_ = {};
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = size;
+    desc.Height = size;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    // Typeless storage with a D32_TYPELESS view pair: one resource serves as both
+    // a depth attachment and a sampled texture, which a concrete D32_FLOAT format
+    // would not allow.
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D32_FLOAT;
+    clear.DepthStencil.Depth = 1.0f;
+
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                                                IID_PPV_ARGS(&shadowMap_)))) {
+        LogError("failed to create the shadow map (%ux%u)", size, size);
+        return false;
+    }
+    SetDebugName(shadowMap_.Get(), "NexiumEngine Shadow Map");
+
+    // DSV in slot 1 of the dedicated heap, next to the scene depth buffer, which
+    // owns slot 0.
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    shadowMapDsv_ = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+    shadowMapDsv_.ptr += static_cast<SIZE_T>(1) * dsvIncrement_;
+    device_->CreateDepthStencilView(shadowMap_.Get(), &dsv, shadowMapDsv_);
+
+    // SRV in the shader-visible heap. Sample with a comparison sampler, so the
+    // shader can use SampleCmp for hardware PCF.
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+    if (!AllocSrv(&cpu, &gpu)) {
+        shadowMap_.Reset();
+        return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(shadowMap_.Get(), &srv, cpu);
+
+    shadowMapSrvCpu_ = cpu;
+    shadowMapSrv_ = gpu;
+    shadowMapSize_ = size;
+    // CreateCommittedResource placed it in DEPTH_WRITE, so the first BeginShadowPass
+    // needs no transition.
+    shadowMapState_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    LogInfo("shadow map: %ux%u ready", size, size);
+    return true;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS GpuContext::PushShadowConstants(const ShadowConstants& constants) {
+    FrameResources& frame = frames_[frameIndex_];
+    uint64_t offset = 0;
+    // 256-byte alignment is the D3D12 requirement for a constant buffer view.
+    if (!frame.shadowConstants.Push(&constants, sizeof(constants), 256, &offset)) {
+        return 0;
+    }
+    return frame.shadowConstants.GpuAddress(offset);
+}
+
+void GpuContext::BeginShadowPass() {
+    if (!inFrame_ || !shadowMap_) return;
+
+    ID3D12GraphicsCommandList* list = CommandList();
+
+    // The map may be in shader-read state from the previous frame's scene pass, so
+    // transition from whatever it actually is rather than assuming. A freshly
+    // created map is already DEPTH_WRITE, in which case no barrier is needed.
+    if (shadowMapState_ != D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+        D3D12_RESOURCE_BARRIER toDepth{};
+        toDepth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toDepth.Transition.pResource = shadowMap_.Get();
+        toDepth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toDepth.Transition.StateBefore = shadowMapState_;
+        toDepth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        list->ResourceBarrier(1, &toDepth);
+        shadowMapState_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    }
+
+    // Depth only: no colour target, so the shadow pass writes nothing but depth.
+    list->OMSetRenderTargets(0, nullptr, FALSE, &shadowMapDsv_);
+    list->ClearDepthStencilView(shadowMapDsv_, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(shadowMapSize_),
+                            static_cast<float>(shadowMapSize_), 0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(shadowMapSize_), static_cast<LONG>(shadowMapSize_)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+
+    inShadowPass_ = true;
+}
+
+void GpuContext::EndShadowPass() {
+    if (!inShadowPass_) return;
+
+    ID3D12GraphicsCommandList* list = CommandList();
+
+    // Back to a sampled texture for the scene pass that follows.
+    D3D12_RESOURCE_BARRIER toShader{};
+    toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toShader.Transition.pResource = shadowMap_.Get();
+    toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &toShader);
+    shadowMapState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    // Restore the swap chain target and the scene viewport for the main pass.
+    const uint32_t backBufferIndex = swapChain_->GetCurrentBackBufferIndex();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(backBufferIndex) * rtvIncrement_;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+
+    D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_),
+                            0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+
+    inShadowPass_ = false;
+}
+
+void GpuContext::DestroyShadowMap() {
+    if (!shadowMap_) return;
+    WaitForIdle();
+    shadowMap_.Reset();
+    if (shadowMapSrvCpu_.ptr) FreeSrv(shadowMapSrvCpu_);
+    shadowMapSrv_ = {};
+    shadowMapSrvCpu_ = {};
+    shadowMapSize_ = 0;
 }
 
 ID3D12GraphicsCommandList* GpuContext::BeginImmediate() {
@@ -688,4 +858,4 @@ void GpuContext::Shutdown() {
     }
 }
 
-} // namespace a3d::internal
+} // namespace n3d::internal

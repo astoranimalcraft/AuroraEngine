@@ -1,7 +1,7 @@
-// Aurora3D — HLSL compilation, root signature and pipeline state caching.
-#include "aurora/shader.h"
+// NexiumEngine — HLSL compilation, root signature and pipeline state caching.
+#include "nexium/shader.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
 #include "internal/gpu.h"
 #include "internal/resources.h"
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 namespace {
 
 // --------------------------------------------------------- state tracking ----
@@ -27,6 +27,7 @@ Shader* gCurrentShader = nullptr;
 Shader* gDefaultShader = nullptr;
 Shader* gLineShader = nullptr;
 Shader* gTextShader = nullptr;
+Shader* gSkyShader = nullptr;
 BlendMode gBlendMode = BlendMode::Opaque;
 CullMode gCullMode = CullMode::Back;
 DepthTest gDepthTest = DepthTest::Less;
@@ -121,7 +122,7 @@ const char* TopologyName(PrimitiveTopology topology) {
     return "?";
 }
 
-// The vertex format every Aurora3D pipeline consumes. Without this the input
+// The vertex format every NexiumEngine pipeline consumes. Without this the input
 // assembler feeds the vertex shader nothing and every draw collapses to a point,
 // so it is not optional even for a fixed layout.
 const D3D12_INPUT_ELEMENT_DESC kVertexLayout[] = {
@@ -173,8 +174,52 @@ ID3D12PipelineState* Shader::GetPipeline(BlendMode blend, CullMode cull, DepthTe
         return nullptr;
     }
 
-    pipelineCache[b][c][d]->SetName(L"Aurora3D Pipeline");
+    pipelineCache[b][c][d]->SetName(L"NexiumEngine Pipeline");
     return pipelineCache[b][c][d].Get();
+}
+
+ID3D12PipelineState* Shader::GetShadowPipeline(CullMode cull) {
+    const int c = static_cast<int>(cull);
+    if (shadowPipelineCache[c]) return shadowPipelineCache[c].Get();
+
+    ID3D12Device* device = internal::GpuContext::Get().Device();
+    if (!device || !vertexBlob) return nullptr;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = internal::RootSignature::Instance().Get();
+    // Only the vertex stage: with no pixel shader and no render target the pass
+    // writes depth alone, which is all a shadow map stores.
+    desc.VS = {vertexBlob->GetBufferPointer(), vertexBlob->GetBufferSize()};
+    desc.PS = {};
+    desc.BlendState = MakeBlendDesc(BlendMode::Opaque);
+    // Front-face culling is the usual defence against shadow acne: the depth
+    // written is the back of the object, so the front faces that are actually
+    // visible are never in front of it. CullMode::None keeps both sides, which is
+    // needed for single-sided geometry such as a ground plane.
+    desc.RasterizerState = MakeRasterizerDesc(cull);
+    // A constant depth bias in the rasteriser complements the shader-side bias and
+    // costs nothing at runtime.
+    desc.RasterizerState.DepthBias = 1000;
+    desc.RasterizerState.SlopeScaledDepthBias = 1.5f;
+    desc.InputLayout = {kVertexLayout, _countof(kVertexLayout)};
+    desc.DepthStencilState = MakeDepthDesc(DepthTest::Less, true);
+    desc.PrimitiveTopologyType = ToTopologyType(topology);
+    desc.NumRenderTargets = 0;   // depth only
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.SampleMask = UINT_MAX;
+    desc.NodeMask = 0;
+    desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&shadowPipelineCache[c]));
+    if (FAILED(hr)) {
+        LogError("shader '%s': shadow pipeline creation failed for cull %d (0x%08lX)",
+                 name.c_str(), c, static_cast<unsigned long>(hr));
+        return nullptr;
+    }
+
+    shadowPipelineCache[c]->SetName(L"NexiumEngine Shadow Pipeline");
+    return shadowPipelineCache[c].Get();
 }
 
 // ---------------------------------------------------------- RootSignature ---
@@ -200,15 +245,17 @@ bool RootSignature::Create(ID3D12Device* device) {
 
     // b0: frame constants, vertex-visible (viewProj is read there).
     // b1: object constants, read by both stages (world in the VS, the rest in the PS).
+    // b2: shadow constants, a root CBV because the block is too large to inline.
     // t0: albedo texture, bound as a single-descriptor table.
+    // t1: shadow map, its own single-descriptor table.
     //
     // Root constants share a layout across both versions, so they are filled once
     // in the 1.1 form and copied down. Descriptor ranges do not: 1.1 adds a Flags
     // field, so each version needs its own range and table parameter.
-    D3D12_DESCRIPTOR_RANGE srvRange10{};
-    D3D12_DESCRIPTOR_RANGE1 srvRange11{};
-    D3D12_ROOT_PARAMETER parameters10[3]{};
-    D3D12_ROOT_PARAMETER1 parameters11[3]{};
+    D3D12_DESCRIPTOR_RANGE srvRange10[2]{};
+    D3D12_DESCRIPTOR_RANGE1 srvRange11[2]{};
+    D3D12_ROOT_PARAMETER parameters10[5]{};
+    D3D12_ROOT_PARAMETER1 parameters11[5]{};
 
     parameters11[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters11[0].Constants.ShaderRegister = 0;
@@ -222,41 +269,67 @@ bool RootSignature::Create(ID3D12Device* device) {
     parameters11[1].Constants.Num32BitValues = kObjectConstantCount;
     parameters11[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    srvRange11.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange11.NumDescriptors = 1;
-    srvRange11.BaseShaderRegister = 0;
-    srvRange11.RegisterSpace = 0;
+    // A root CBV rather than root constants: the shadow block is 24 DWORDs, and
+    // the signature only has 64 DWORDs total. A root CBV is 2 no matter the size.
+    parameters11[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters11[2].Descriptor.ShaderRegister = 2;
+    parameters11[2].Descriptor.RegisterSpace = 0;
+    parameters11[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    srvRange11[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange11[0].NumDescriptors = 1;
+    srvRange11[0].BaseShaderRegister = 0;
+    srvRange11[0].RegisterSpace = 0;
     // Descriptors are written once when a texture is created and never rewritten
     // while a command list referencing them is open, so the default (non-volatile)
     // range flags are correct and let the driver cache the table.
-    srvRange11.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
-    srvRange11.OffsetInDescriptorsFromTableStart = 0;
+    srvRange11[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+    srvRange11[0].OffsetInDescriptorsFromTableStart = 0;
 
-    parameters11[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters11[2].DescriptorTable.NumDescriptorRanges = 1;
-    parameters11[2].DescriptorTable.pDescriptorRanges = &srvRange11;
-    parameters11[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    srvRange11[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange11[1].NumDescriptors = 1;
+    srvRange11[1].BaseShaderRegister = 1;
+    srvRange11[1].RegisterSpace = 0;
+    srvRange11[1].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+    srvRange11[1].OffsetInDescriptorsFromTableStart = 0;
 
-    srvRange10.RangeType = srvRange11.RangeType;
-    srvRange10.NumDescriptors = srvRange11.NumDescriptors;
-    srvRange10.BaseShaderRegister = srvRange11.BaseShaderRegister;
-    srvRange10.RegisterSpace = srvRange11.RegisterSpace;
-    srvRange10.OffsetInDescriptorsFromTableStart = srvRange11.OffsetInDescriptorsFromTableStart;
+    parameters11[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters11[3].DescriptorTable.NumDescriptorRanges = 1;
+    parameters11[3].DescriptorTable.pDescriptorRanges = &srvRange11[0];
+    parameters11[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    parameters11[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters11[4].DescriptorTable.NumDescriptorRanges = 1;
+    parameters11[4].DescriptorTable.pDescriptorRanges = &srvRange11[1];
+    parameters11[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     for (int i = 0; i < 2; ++i) {
+        srvRange10[i].RangeType = srvRange11[i].RangeType;
+        srvRange10[i].NumDescriptors = srvRange11[i].NumDescriptors;
+        srvRange10[i].BaseShaderRegister = srvRange11[i].BaseShaderRegister;
+        srvRange10[i].RegisterSpace = srvRange11[i].RegisterSpace;
+        srvRange10[i].OffsetInDescriptorsFromTableStart = srvRange11[i].OffsetInDescriptorsFromTableStart;
+    }
+
+    for (int i = 0; i < 3; ++i) {
         parameters10[i].ParameterType = parameters11[i].ParameterType;
         parameters10[i].Constants = parameters11[i].Constants;
         parameters10[i].ShaderVisibility = parameters11[i].ShaderVisibility;
     }
-    parameters10[2].ParameterType = parameters11[2].ParameterType;
-    parameters10[2].DescriptorTable.NumDescriptorRanges = 1;
-    parameters10[2].DescriptorTable.pDescriptorRanges = &srvRange10;
-    parameters10[2].ShaderVisibility = parameters11[2].ShaderVisibility;
+    for (int i = 3; i < 5; ++i) {
+        parameters10[i].ParameterType = parameters11[i].ParameterType;
+        parameters10[i].DescriptorTable.NumDescriptorRanges = 1;
+        parameters10[i].DescriptorTable.pDescriptorRanges = &srvRange10[i - 3];
+        parameters10[i].ShaderVisibility = parameters11[i].ShaderVisibility;
+    }
 
     // s0: one static sampler shared by every shader, so no sampler descriptors
     // are ever needed and the sampler is guaranteed to be in the static path.
     // s1: a point/clamp sampler used by the bitmap-font text shader.
-    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+    // s2: a comparison sampler for the shadow map. ComparisonFunc is LessEqual, so
+    // SampleCmp returns 1 when the fragment is lit; the hardware filters the result
+    // across the four taps of a bilinear fetch, which is free 2x2 PCF.
+    D3D12_STATIC_SAMPLER_DESC samplers[3]{};
     samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -284,6 +357,24 @@ bool RootSignature::Create(ID3D12Device* device) {
     samplers[1].ShaderRegister = 1;
     samplers[1].RegisterSpace = 0;
     samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    // Comparison sampler: MIN_MAG_MIP_LINEAR with a COMPARISON filter, which is the
+    // combination that makes SampleCmp do a filtered comparison (hardware PCF).
+    samplers[2].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+    samplers[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[2].MipLODBias = 0.0f;
+    samplers[2].MaxAnisotropy = 1;
+    samplers[2].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    // Outside the map counts as lit, so geometry past the light's far plane is not
+    // swallowed by shadow.
+    samplers[2].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    samplers[2].MinLOD = 0.0f;
+    samplers[2].MaxLOD = D3D12_FLOAT32_MAX;
+    samplers[2].ShaderRegister = 2;
+    samplers[2].RegisterSpace = 0;
+    samplers[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC desc10{};
     desc10.NumParameters = _countof(parameters10);
@@ -356,7 +447,7 @@ int64_t FileWriteTime(const char* path) {
 
 // HLSL #include resolution. Relative to the including file first, then the
 // engine's own shader directory, then the embedded sources, so
-// `#include "aurora.hlsli"` resolves even when nothing is on disk.
+// `#include "nexium.hlsli"` resolves even when nothing is on disk.
 class IncludeHandler : public ID3DInclude {
 public:
     explicit IncludeHandler(std::string includeDir) : includeDir_(std::move(includeDir)) {}
@@ -689,7 +780,7 @@ Shader* LineShader() { return gLineShader; }
 Shader* TextShader() { return gTextShader; }
 
 // Loads one of the engine's own shaders. A copy next to the executable wins over
-// the embedded source, so a user can drop in a modified aurora_basic.hlsl without
+// the embedded source, so a user can drop in a modified nexium_basic.hlsl without
 // rebuilding the engine.
 Shader* LoadBuiltin(const char* fileName, const char* debugName) {
     const std::string inShadersDir = std::string("shaders/") + fileName;
@@ -720,9 +811,9 @@ Shader* LoadBuiltin(const char* fileName, const char* debugName) {
 }
 
 bool CreateBuiltinShaders() {
-    gDefaultShader = LoadBuiltin("aurora_basic.hlsl", "aurora_basic");
-    gLineShader = LoadBuiltin("aurora_line.hlsl", "aurora_line");
-    gTextShader = LoadBuiltin("aurora_text.hlsl", "aurora_text");
+    gDefaultShader = LoadBuiltin("nexium_basic.hlsl", "nexium_basic");
+    gLineShader = LoadBuiltin("nexium_line.hlsl", "nexium_line");
+    gTextShader = LoadBuiltin("nexium_text.hlsl", "nexium_text");
     if (!gDefaultShader || !gLineShader || !gTextShader) {
         LogError("failed to create the built-in shaders");
         return false;
@@ -733,14 +824,26 @@ bool CreateBuiltinShaders() {
     return true;
 }
 
+// Compiled on first use, not at init: a program that never draws a sky should not
+// pay for the compile. The depth test and cull mode are per-draw, so DrawSky()
+// supplies them rather than the shader carrying them.
+Shader* SkyShader() {
+    if (gSkyShader) return gSkyShader;
+    gSkyShader = LoadBuiltin("nexium_sky.hlsl", "nexium_sky");
+    return gSkyShader;
+}
+
 void DestroyBuiltinShaders() {
     gCurrentShader = nullptr;
     delete gDefaultShader;
     delete gLineShader;
     delete gTextShader;
+    // The sky shader may never have been compiled, in which case this is a no-op.
+    delete gSkyShader;
     gDefaultShader = nullptr;
     gLineShader = nullptr;
     gTextShader = nullptr;
+    gSkyShader = nullptr;
 }
 } // namespace internal
 
@@ -799,4 +902,4 @@ void ReloadChangedShaders() {
     }
 }
 
-} // namespace a3d
+} // namespace n3d

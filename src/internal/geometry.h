@@ -6,13 +6,13 @@
 // box can verify them, and mesh.cpp stays concerned only with uploading.
 #pragma once
 
-#include "aurora/math.h"
-#include "aurora/mesh.h"
+#include "nexium/math.h"
+#include "nexium/mesh.h"
 
 #include <cstdint>
 #include <vector>
 
-namespace a3d::geometry {
+namespace n3d::geometry {
 
 void BuildCube(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices, float size);
 
@@ -27,4 +27,23 @@ void BuildTube(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
 void BuildPlane(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
                 float width, float depth, int subdivisions);
 
-} // namespace a3d::geometry
+// A ring with `majorRadius` from the centre to the middle of the tube and
+// `minorRadius` as the tube's own radius, lying in the XZ plane.
+void BuildTorus(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                float majorRadius, float minorRadius, int majorSegments, int minorSegments);
+
+// A square base of `baseSize` in XZ with the apex on +Y, centred on the origin
+// (base at -height/2, apex at +height/2) to match the other primitives.
+void BuildPyramid(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                  float baseSize, float height);
+
+// A flat disc in the XZ plane facing +Y, built as a triangle fan.
+void BuildDisk(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+               float radius, int segments);
+
+// A capsule: a cylinder of `height` capped by two hemispheres of `radius`, all
+// centred on the origin. The total extent along Y is height + 2 * radius.
+void BuildCapsule(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                  float radius, float height, int slices, int rings);
+
+} // namespace n3d::geometry

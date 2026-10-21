@@ -1,14 +1,14 @@
-// Aurora3D — small runtime helpers shared by the whole library.
+// NexiumEngine — small runtime helpers shared by the whole library.
 //
 // The header-side game helpers (Transform, Random, Timer, easing) are pure math.
 // The only thing that needs a translation unit is the process-wide RNG, which is
 // seeded from the clock so a program that never calls SetRandomSeed() still gets
 // a different sequence every run.
-#include "aurora/math.h"
+#include "nexium/math.h"
 
 #include "internal/common.h"
 
-namespace a3d {
+namespace n3d {
 
 Random& GlobalRandom() {
     // Function-local static: constructed on first use, so nothing runs before
@@ -32,4 +32,4 @@ int RandomInt(int minValue, int maxValue) { return GlobalRandom().RangeInt(minVa
 
 bool RandomChance(float probability) { return GlobalRandom().Chance(probability); }
 
-} // namespace a3d
+} // namespace n3d

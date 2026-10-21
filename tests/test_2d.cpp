@@ -3,12 +3,12 @@
 // Camera2D is header-only and free of DirectX, so its view/projection matrices and
 // the screen<->world conversions can be checked on any host. Getting these wrong is
 // invisible until a sprite lands in the wrong place, so they are worth a test.
-#include "aurora/draw.h"
+#include "nexium/draw.h"
 
 #include <cmath>
 #include <cstdio>
 
-using namespace a3d;
+using namespace n3d;
 
 static int gFailures = 0;
 static int gChecks = 0;

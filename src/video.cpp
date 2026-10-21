@@ -1,26 +1,28 @@
-// Aurora3D — video playback backend (Media Foundation).
+// NexiumEngine — video playback backend (Media Foundation).
 //
 // A Video wraps an IMFSourceReader configured to deliver RGB32 (BGRA) frames.
-// UpdateVideo() pulls one frame, skipping ahead when the display has fallen
-// behind the stream's own timestamps, and writes the pixels straight into an
-// upload-heap texture the engine samples like any other. DrawVideo() then queues
-// a screen-space quad, so video needs no special render path.
+// UpdateVideo() pulls one frame and copies it into a texture through a staging
+// buffer, on an upload command list. DrawVideo() then queues a screen-space quad,
+// so video needs no special render path.
 //
-// Decoding is synchronous: one frame is pulled per UpdateVideo() call. That keeps
+// Decoding is synchronous: frames are pulled during UpdateVideo(), which the
+// engine calls once per frame. Playback is driven by the wall clock, so a clip
+// runs at its own frame rate no matter what the program renders at. That keeps
 // the subsystem free of threads and shared state at the cost of a short stall
 // when a frame is expensive to decode; a background decoder can be added later
 // without changing this interface.
 //
 // Everything is platform gated and best-effort: without Media Foundation, or for
 // a file it cannot open, LoadVideo() returns nullptr and the program continues.
-#include "aurora/video.h"
+#include "nexium/video.h"
 
-#include "aurora/draw.h"
-#include "aurora/log.h"
-#include "aurora/texture.h"
+#include "nexium/draw.h"
+#include "nexium/log.h"
+#include "nexium/texture.h"
 
 #include "internal/gpu.h"
 #include "internal/resources.h"
+#include "internal/window.h"
 
 #include <d3d12.h>
 #include <mfapi.h>
@@ -29,26 +31,39 @@
 
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 
 struct Video {
     IMFSourceReader* reader = nullptr;
-    Texture* texture = nullptr;      // upload-heap texture, written in place
-    uint8_t* mapped = nullptr;       // persistent mapping of the texture
-    uint32_t width = 0;
+    // Default-heap texture holding the frame, sampled like any other texture. It
+    // is never written directly: each new frame is copied into it from a staging
+    // buffer on the frame's command list.
+    Texture* texture = nullptr;
+    uint32_t width = 0;              // frame width, as the video reports it
     uint32_t height = 0;
-    uint32_t stride = 0;             // bytes per row in the texture
+    // Staging buffer the decoder's frame is written into, and the footprint that
+    // describes how the device wants the rows laid out inside it.
+    ComPtr<ID3D12Resource> staging;
+    uint8_t* stagingMapped = nullptr;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    uint32_t rowPitch = 0;           // bytes per row in the staging buffer
     float fps = 30.0f;
     float duration = 0.0f;           // seconds
-    float position = 0.0f;           // seconds, advanced by frame timestamps
+    float position = 0.0f;           // seconds, from the last decoded frame
+    // Playback clock, in seconds, advanced by real elapsed time while playing.
+    // Frames are pulled to keep `clock` ahead of `position`; without this the
+    // decoder is advanced once per UpdateVideo() call, which makes a 30 fps clip
+    // play at the frame rate instead of at 30 fps.
+    double clock = 0.0;
+    float frameInterval = 1.0f / 30.0f;   // seconds between frames, from the stream
     bool playing = false;
     bool looping = false;
     bool ended = false;
-    bool ready = false;              // a frame has been uploaded
+    bool ready = false;              // a frame has reached the texture
     std::string name;
-    // Scratch buffer for the decoded frame, reused every update.
 };
 
 namespace {
@@ -56,18 +71,41 @@ namespace {
 bool gMediaFoundationStarted = false;
 bool gMediaFoundationTried = false;
 
+// Wall clock of the previous UpdateVideo(), so playback can be advanced by real
+// elapsed time instead of by frame count.
+double gLastUpdateTime = 0.0;
+
 // Every live Video, so the per-frame UpdateVideo() can advance them without the
 // caller having to. A program owns its handles; this list only mirrors them.
 std::vector<Video*> gVideos;
 
+// Defined further down, next to the other decode helpers; PlayVideo() needs it to
+// put a picture on screen before the first UpdateVideo() tick.
+bool ReadAndUploadFrame(Video* video);
+
 // Starts Media Foundation once. Returns false when unavailable, which makes every
 // video load fail cleanly.
+//
+// Media Foundation requires an initialised COM apartment before it can create any
+// object, and the WIC path in texture.cpp is the only other place that calls
+// CoInitializeEx — so a program that only plays video never initialises COM and
+// every call here fails with CO_E_NOTINITIALIZED. MFSTARTUP_FULL (the documented
+// default) rather than LITE, which only skips the socket layer.
 bool EnsureMediaFoundation() {
     if (gMediaFoundationStarted) return true;
     if (gMediaFoundationTried) return false;
     gMediaFoundationTried = true;
 
-    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // RPC_E_CHANGED_MODE means COM is already up in another apartment; that is
+    // fine, Media Foundation works from either.
+    if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE) {
+        LogWarn("video: CoInitializeEx failed (0x%08lX); running without video",
+                static_cast<unsigned long>(comResult));
+        return false;
+    }
+
+    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) {
         LogWarn("video: MFStartup failed; running without video");
         return false;
     }
@@ -79,67 +117,114 @@ std::wstring Widen(const char* text) {
     if (!text) return std::wstring();
     const int length = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
     if (length <= 0) return std::wstring();
-    std::wstring wide(static_cast<size_t>(length - 1), L'\0');
+    std::wstring wide(static_cast<size_t>(length), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wide.data(), length);
     return wide;
 }
 
-// Creates an upload-heap BGRA texture, mapped once and written in place. Using an
-// upload heap (rather than a default-heap texture plus copies) means a new frame
-// is a plain memcpy from the decoder with no command list involvement.
-Texture* CreateVideoTexture(uint32_t width, uint32_t height, uint8_t** outMapped) {
+// Creates the frame texture as an ordinary engine texture. It goes through the
+// same default-heap + staging upload path as every other texture rather than being
+// an upload-heap resource written directly: an upload-heap texture is not valid on
+// every implementation (vkd3d, used for D3D12 on Linux, rejects it outright with
+// E_INVALIDARG), and the copy path is the one the rest of the engine already uses.
+//
+// The initial contents are black so the texture is valid before the first frame.
+Texture* CreateVideoTexture(uint32_t width, uint32_t height) {
+    std::vector<uint8_t> black(static_cast<size_t>(width) * height * 4u, 0u);
+    TextureDesc desc;
+    desc.width = width;
+    desc.height = height;
+    desc.pixels = black.data();
+    desc.generateMips = false;
+    desc.debugName = "(video frame)";
+    return LoadTexture(desc);
+}
+
+// Allocates the staging buffer a frame is copied through, sized from the device's
+// own footprint for the texture so the row pitch is whatever the device requires.
+bool CreateVideoStaging(Video* video) {
     auto& gpu = internal::GpuContext::Get();
     ID3D12Device* device = gpu.Device();
-    if (!device) return nullptr;
+    if (!device || !video->texture) return false;
 
-    const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    const D3D12_RESOURCE_DESC textureDesc = video->texture->resource->GetDesc();
+    UINT numRows = 0;
+    UINT64 rowSize = 0;
+    UINT64 totalBytes = 0;
+    device->GetCopyableFootprints(&textureDesc, 0, 1, 0, &video->footprint, &numRows, &rowSize,
+                                  &totalBytes);
+    video->rowPitch = video->footprint.Footprint.RowPitch;
 
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
     D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = totalBytes;
+    desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = format;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    auto* texture = new Texture();
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&texture->resource)))) {
-        LogError("video: failed to create the frame texture");
-        delete texture;
-        return nullptr;
+                                               IID_PPV_ARGS(&video->staging)))) {
+        LogError("video: failed to create the frame staging buffer");
+        return false;
     }
-
-    if (!gpu.AllocSrv(&texture->cpuHandle, &texture->gpuHandle)) {
-        delete texture;
-        return nullptr;
-    }
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(texture->resource.Get(), &srv, texture->cpuHandle);
 
     D3D12_RANGE readRange{0, 0};
-    if (FAILED(texture->resource->Map(0, &readRange, reinterpret_cast<void**>(outMapped)))) {
-        LogError("video: failed to map the frame texture");
-        gpu.FreeSrv(texture->cpuHandle);
-        delete texture;
-        return nullptr;
+    if (FAILED(video->staging->Map(0, &readRange,
+                                   reinterpret_cast<void**>(&video->stagingMapped)))) {
+        LogError("video: failed to map the frame staging buffer");
+        video->staging.Reset();
+        return false;
     }
+    return true;
+}
 
-    texture->width = width;
-    texture->height = height;
-    texture->name = "(video frame)";
-    return texture;
+// Copies the frame that ReadAndUploadFrame() just decoded into the texture. Runs
+// on an upload command list, which waits for the GPU first; that stall is the price
+// of keeping video free of threading and of any per-frame GPU allocation.
+bool UploadVideoFrame(Video* video) {
+    if (!video->texture || !video->staging || !video->stagingMapped) return false;
+
+    auto& gpu = internal::GpuContext::Get();
+    ID3D12GraphicsCommandList* list = gpu.BeginUpload();
+    if (!list) return false;
+
+    D3D12_RESOURCE_BARRIER toCopy{};
+    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toCopy.Transition.pResource = video->texture->resource.Get();
+    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &toCopy);
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = video->staging.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = video->footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = video->texture->resource.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+    D3D12_RESOURCE_BARRIER toShader{};
+    toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toShader.Transition.pResource = video->texture->resource.Get();
+    toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &toShader);
+
+    gpu.EndUpload();
+    return true;
 }
 
 // Reads the stream's frame rate, size and duration into the Video.
@@ -154,8 +239,9 @@ void ReadStreamProperties(Video* video) {
         }
         UINT32 fpsNum = 0, fpsDen = 0;
         if (SUCCEEDED(MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fpsNum, &fpsDen)) &&
-            fpsDen != 0) {
+            fpsDen != 0 && fpsNum != 0) {
             video->fps = static_cast<float>(fpsNum) / static_cast<float>(fpsDen);
+            video->frameInterval = static_cast<float>(fpsDen) / static_cast<float>(fpsNum);
         }
         type->Release();
     }
@@ -176,6 +262,28 @@ void ReadStreamProperties(Video* video) {
     }
 }
 
+// Moves the reader to `seconds` and drops the frame currently on screen, so the
+// next decoded frame is the one at the new position. `position` is pushed forward
+// as well: the sync loop in UpdateVideo() only decodes while the clock is ahead of
+// it, so leaving it at the old value would stall playback until the clock caught
+// up with the old position again.
+void SeekVideoInternal(Video* video, double seconds) {
+    if (!video || !video->reader) return;
+
+    const double clamped = seconds < 0.0 ? 0.0 : seconds;
+
+    PROPVARIANT position;
+    PropVariantInit(&position);
+    position.vt = VT_I8;
+    position.hVal.QuadPart = static_cast<LONGLONG>(clamped * 10000000.0);
+    video->reader->SetCurrentPosition(GUID_NULL, position);
+    PropVariantClear(&position);
+
+    video->position = static_cast<float>(clamped);
+    video->clock = clamped;
+    video->ended = false;
+}
+
 } // namespace
 
 Video* LoadVideo(const char* path) {
@@ -190,13 +298,25 @@ Video* LoadVideo(const char* path) {
     auto* video = new Video();
     video->name = path;
 
-    if (FAILED(MFCreateSourceReaderFromURL(widePath.c_str(), nullptr, &video->reader))) {
-        LogError("video: cannot open '%s'", path);
+    // MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING lets the reader convert the native
+    // YUV format to RGB32 through the video processor MFT. Without it, asking for
+    // RGB32 on a stream that is not already RGB fails with MF_E_INVALIDMEDIATYPE
+    // for every ordinary H.264/MP4 file, because the decoder only emits NV12.
+    IMFAttributes* attributes = nullptr;
+    if (SUCCEEDED(MFCreateAttributes(&attributes, 1))) {
+        attributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    }
+    const HRESULT openResult =
+        MFCreateSourceReaderFromURL(widePath.c_str(), attributes, &video->reader);
+    if (attributes) attributes->Release();
+    if (FAILED(openResult)) {
+        LogError("video: cannot open '%s' (0x%08lX)", path,
+                 static_cast<unsigned long>(openResult));
         delete video;
         return nullptr;
     }
 
-    // Only the first video stream, and ask for BGRA so no conversion is needed.
+    // Only the first video stream.
     video->reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
     video->reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE);
 
@@ -225,9 +345,14 @@ Video* LoadVideo(const char* path) {
         return nullptr;
     }
 
-    video->stride = video->width * 4;
-    video->texture = CreateVideoTexture(video->width, video->height, &video->mapped);
+    video->texture = CreateVideoTexture(video->width, video->height);
     if (!video->texture) {
+        video->reader->Release();
+        delete video;
+        return nullptr;
+    }
+    if (!CreateVideoStaging(video)) {
+        UnloadTexture(video->texture);
         video->reader->Release();
         delete video;
         return nullptr;
@@ -247,26 +372,39 @@ void UnloadVideo(Video* video) {
             break;
         }
     }
-    if (video->texture) {
-        if (video->mapped) video->texture->resource->Unmap(0, nullptr);
-        UnloadTexture(video->texture);
+    if (video->staging) {
+        if (video->stagingMapped) video->staging->Unmap(0, nullptr);
+        // The GPU may still be reading the staging buffer, so hand it to the
+        // deferred queue rather than releasing it here.
+        auto& gpu = internal::GpuContext::Get();
+        ComPtr<ID3D12Resource> staging = video->staging;
+        gpu.Defer([staging]() mutable { staging.Reset(); });
     }
+    if (video->texture) UnloadTexture(video->texture);
     if (video->reader) video->reader->Release();
     delete video;
 }
 
 void PlayVideo(Video* video) {
     if (!video) return;
+    // Restarting from the top only makes sense when the clip is not already at
+    // its start; calling Play() on a paused video should resume, not rewind.
+    if (video->position > 0.0f || video->ended) SeekVideoInternal(video, 0.0);
     video->playing = true;
     video->ended = false;
-    video->position = 0.0f;
+    // Decode one frame straight away so the first DrawVideo() after Play() has a
+    // picture instead of a black texture.
+    if (!video->ready) {
+        ReadAndUploadFrame(video);
+        video->clock = 0.0;
+    }
 }
 
 void StopVideo(Video* video) {
     if (!video) return;
     video->playing = false;
     video->ended = false;
-    video->position = 0.0f;
+    SeekVideoInternal(video, 0.0);
 }
 
 void PauseVideo(Video* video) {
@@ -275,8 +413,19 @@ void PauseVideo(Video* video) {
 
 void ResumeVideo(Video* video) {
     if (!video) return;
-    if (video->ended) PlayVideo(video);
-    else video->playing = true;
+    if (video->ended) {
+        PlayVideo(video);
+        return;
+    }
+    // The clock is kept at the paused position, so resuming does not jump.
+    video->playing = true;
+}
+
+void SeekVideo(Video* video, float seconds) {
+    if (!video) return;
+    SeekVideoInternal(video, seconds);
+    // Show the new position right away rather than waiting for the next tick.
+    if (video->playing) ReadAndUploadFrame(video);
 }
 
 bool IsVideoPlaying(const Video* video) { return video && video->playing; }
@@ -325,15 +474,10 @@ bool ReadAndUploadFrame(Video* video) {
         if (sample) sample->Release();
         video->ended = true;
         if (video->looping) {
-            // Rewind by seeking the reader back to the start.
-            PROPVARIANT position;
-            PropVariantInit(&position);
-            position.vt = VT_I8;
-            position.hVal.QuadPart = 0;
-            video->reader->SetCurrentPosition(GUID_NULL, position);
-            PropVariantClear(&position);
-            video->position = 0.0f;
-            video->ended = false;
+            // Rewind through the same path as a seek, so the playback clock is
+            // reset with the reader; leaving the clock behind would make the next
+            // tick decode the whole clip at once trying to catch up.
+            SeekVideoInternal(video, 0.0);
             return false;
         }
         video->playing = false;
@@ -351,24 +495,42 @@ bool ReadAndUploadFrame(Video* video) {
     BYTE* data = nullptr;
     DWORD maxLength = 0;
     DWORD currentLength = 0;
-    bool uploaded = false;
+    bool decoded = false;
     if (SUCCEEDED(buffer->Lock(&data, &maxLength, &currentLength))) {
-        // RGB32 frames are tightly packed at width * 4 bytes per row. Copy only
-        // whole rows, and never read past what the buffer actually holds.
-        const size_t wanted = static_cast<size_t>(video->stride) * video->height;
-        const size_t available = currentLength < wanted ? currentLength : wanted;
-        std::memcpy(video->mapped, data, available);
+        // The decoder's frame is tightly packed at `width * 4` bytes per row while
+        // the staging buffer's rows follow the device's own pitch, so the copy walks
+        // one row at a time. A single memcpy would run past the end of the decoder's
+        // buffer on the last row whenever the two pitches differ.
+        const size_t sourcePitch = static_cast<size_t>(video->width) * 4u;
+        const size_t needed = sourcePitch * video->height;
+
+        if (currentLength >= needed) {
+            for (uint32_t y = 0; y < video->height; ++y) {
+                uint8_t* destination = video->stagingMapped + video->footprint.Offset +
+                                       static_cast<size_t>(y) * video->rowPitch;
+                std::memcpy(destination, data + static_cast<size_t>(y) * sourcePitch, sourcePitch);
+                // RGB32 is BGRA in memory; the engine samples RGBA8.
+                for (uint32_t x = 0; x < video->width; ++x) {
+                    std::swap(destination[x * 4 + 0], destination[x * 4 + 2]);
+                }
+            }
+            decoded = true;
+        } else {
+            LogError("video: decoded frame is short (%lu bytes, wanted %zu)",
+                     static_cast<unsigned long>(currentLength), needed);
+        }
         buffer->Unlock();
-        uploaded = available == wanted;
     }
     buffer->Release();
     sample->Release();
 
-    if (uploaded) {
-        video->ready = true;
+    if (decoded) {
         video->position = static_cast<float>(timestamp) / 10000000.0f;
+        // Sticky: once a frame has reached the texture, a later upload failure
+        // should not make the video look unloaded again.
+        if (UploadVideoFrame(video)) video->ready = true;
     }
-    return uploaded;
+    return decoded;
 }
 
 } // namespace
@@ -379,20 +541,44 @@ bool DrawVideo(Video* video, float x, float y, Color tint) {
 
 bool DrawVideoV(Video* video, Vec2 position, Color tint) {
     if (!video || !video->texture || !video->ready) return false;
-    DrawTextureV(video->texture, position, tint);
+    const float w = static_cast<float>(video->width);
+    const float h = static_cast<float>(video->height);
+    DrawTexturePro(video->texture, Rect{0.0f, 0.0f, w, h},
+                   Rect{position.x, position.y, w, h}, Vec2{}, 0.0f, tint);
     return true;
 }
 
 Texture* GetVideoTexture(Video* video) { return video ? video->texture : nullptr; }
 
 void UpdateVideo() {
-    // Advance every playing video by one frame. Pulling one frame per call keeps
-    // playback locked to the frame rate, which is what a game wants; a video that
-    // needs to run ahead can call this more than once.
+    // Advance every playing video by however many frames the wall clock says are
+    // due. Pulling exactly one frame per call, as an earlier version did, made
+    // playback speed a function of the frame rate: a 30 fps clip ran fast at
+    // 120 fps and slow at 15 fps. The loop is bounded so a long stall (a
+    // debugger break, a window drag) cannot turn into an unbounded decode burst.
+    auto& window = internal::Window::Get();
+    const double now = window.Time();
+    const double delta = now - gLastUpdateTime;
+    gLastUpdateTime = now;
+    // A negative or absurd delta means the clock was reset or the process was
+    // suspended; skip this tick rather than fast-forwarding the whole clip.
+    const double elapsed = (delta > 0.0 && delta < 1.0) ? delta : 0.0;
+
     for (Video* video : gVideos) {
         if (!video || !video->playing) continue;
-        ReadAndUploadFrame(video);
+
+        video->clock += elapsed;
+
+        const int maxFrames = 4;   // decode at most this many per tick
+        for (int i = 0; i < maxFrames; ++i) {
+            // Decode while the next frame is already due. `position` is the
+            // timestamp of the frame in the texture, so this keeps the picture
+            // no more than one frame behind the clock.
+            if (video->position + video->frameInterval > video->clock) break;
+            if (!ReadAndUploadFrame(video)) break;
+            if (!video->playing) break;   // hit the end without looping
+        }
     }
 }
 
-} // namespace a3d
+} // namespace n3d

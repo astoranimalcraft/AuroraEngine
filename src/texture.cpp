@@ -1,20 +1,29 @@
-// Aurora3D — texture creation, upload and image loading.
-#include "aurora/texture.h"
+// NexiumEngine — texture creation, upload and image loading.
+#include "nexium/texture.h"
 
-#include "aurora/log.h"
+#include "nexium/log.h"
 
+#include "internal/envmap.h"
 #include "internal/gpu.h"
+#include "internal/hdr.h"
 #include "internal/resources.h"
 
 #include <d3d12.h>
 #include <wincodec.h>
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 namespace {
+
+using internal::BytesPerPixel;
+using internal::FloatToHalf;
+using internal::HalfToFloat;
 
 ComPtr<IWICImagingFactory> gWicFactory;
 bool gComInitialized = false;
@@ -47,11 +56,25 @@ uint32_t MipCountFor(uint32_t width, uint32_t height) {
     return levels;
 }
 
+DXGI_FORMAT ToDxgiFormat(TextureFormat format, bool srgb) {
+    switch (format) {
+        case TextureFormat::RGBA16F:
+            // There is no sRGB variant of a float format: the values are already
+            // linear, which is exactly what the shader wants.
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case TextureFormat::RGBA8:
+        default:
+            return srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
 // Uploads `pixels` into a freshly created default-heap texture, generating mips
 // when requested. Runs on an immediate command list and blocks until done, so the
 // caller can free the source pixels immediately afterwards.
 Texture* CreateTextureFromPixels(const uint8_t* pixels, uint32_t width, uint32_t height,
-                                 bool generateMips, const char* debugName) {
+                                 bool generateMips, const char* debugName,
+                                 TextureFormat sourceFormat = TextureFormat::RGBA8,
+                                 bool srgb = false) {
     auto& gpu = internal::GpuContext::Get();
     ID3D12Device* device = gpu.Device();
     if (!device || !pixels || width == 0 || height == 0) {
@@ -61,8 +84,9 @@ Texture* CreateTextureFromPixels(const uint8_t* pixels, uint32_t width, uint32_t
     }
 
     const uint32_t mipLevels = generateMips ? MipCountFor(width, height) : 1;
-    const DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    const uint32_t bytesPerPixel = 4;
+    const DXGI_FORMAT format = ToDxgiFormat(sourceFormat, srgb);
+    const uint32_t bytesPerPixel = BytesPerPixel(sourceFormat);
+    const bool isFloat = sourceFormat == TextureFormat::RGBA16F;
 
     D3D12_HEAP_PROPERTIES defaultHeap{};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -135,7 +159,7 @@ Texture* CreateTextureFromPixels(const uint8_t* pixels, uint32_t width, uint32_t
     for (uint32_t level = 1; level < mipLevels; ++level) {
         const uint32_t nextWidth = mipWidth > 1 ? mipWidth / 2 : 1;
         const uint32_t nextHeight = mipHeight > 1 ? mipHeight / 2 : 1;
-        std::vector<uint8_t>& src = levels[level - 1];
+        const std::vector<uint8_t>& src = levels[level - 1];
         std::vector<uint8_t>& dst = levels[level];
         dst.resize(static_cast<size_t>(nextWidth) * nextHeight * bytesPerPixel);
 
@@ -146,14 +170,32 @@ Texture* CreateTextureFromPixels(const uint8_t* pixels, uint32_t width, uint32_t
                 const uint32_t x1 = (x * 2 + 1) < mipWidth ? x * 2 + 1 : mipWidth - 1;
                 const uint32_t y1 = (y * 2 + 1) < mipHeight ? y * 2 + 1 : mipHeight - 1;
 
-                for (uint32_t c = 0; c < bytesPerPixel; ++c) {
-                    const uint32_t sum =
-                        src[(static_cast<size_t>(y0) * mipWidth + x0) * bytesPerPixel + c] +
-                        src[(static_cast<size_t>(y0) * mipWidth + x1) * bytesPerPixel + c] +
-                        src[(static_cast<size_t>(y1) * mipWidth + x0) * bytesPerPixel + c] +
-                        src[(static_cast<size_t>(y1) * mipWidth + x1) * bytesPerPixel + c];
-                    dst[(static_cast<size_t>(y) * nextWidth + x) * bytesPerPixel + c] =
-                        static_cast<uint8_t>(sum / 4);
+                const size_t index00 = (static_cast<size_t>(y0) * mipWidth + x0) * bytesPerPixel;
+                const size_t index01 = (static_cast<size_t>(y0) * mipWidth + x1) * bytesPerPixel;
+                const size_t index10 = (static_cast<size_t>(y1) * mipWidth + x0) * bytesPerPixel;
+                const size_t index11 = (static_cast<size_t>(y1) * mipWidth + x1) * bytesPerPixel;
+                const size_t out = (static_cast<size_t>(y) * nextWidth + x) * bytesPerPixel;
+
+                if (isFloat) {
+                    // Averaging in float, not in the stored half. Adding halves as
+                    // integers would corrupt them, and even adding as float before
+                    // dividing keeps a bright sun from being rounded to death over
+                    // successive levels.
+                    const uint16_t* srcHalf = reinterpret_cast<const uint16_t*>(src.data());
+                    uint16_t* dstHalf = reinterpret_cast<uint16_t*>(dst.data());
+                    for (uint32_t c = 0; c < 4; ++c) {
+                        const float sum = HalfToFloat(srcHalf[index00 / 2 + c]) +
+                                          HalfToFloat(srcHalf[index01 / 2 + c]) +
+                                          HalfToFloat(srcHalf[index10 / 2 + c]) +
+                                          HalfToFloat(srcHalf[index11 / 2 + c]);
+                        dstHalf[out / 2 + c] = FloatToHalf(sum * 0.25f);
+                    }
+                } else {
+                    for (uint32_t c = 0; c < bytesPerPixel; ++c) {
+                        const uint32_t sum = src[index00 + c] + src[index01 + c] +
+                                             src[index10 + c] + src[index11 + c];
+                        dst[out + c] = static_cast<uint8_t>(sum / 4);
+                    }
                 }
             }
         }
@@ -179,7 +221,20 @@ Texture* CreateTextureFromPixels(const uint8_t* pixels, uint32_t width, uint32_t
     texture->resource = resource;
     texture->width = width;
     texture->height = height;
+    texture->format = sourceFormat;
     texture->name = debugName ? debugName : "(texture)";
+
+    // An equirectangular image can serve as the sky, and the lighting summary is
+    // computed here while the source pixels are still around. It is skipped for a
+    // 1x1 placeholder, which cannot be an environment map anyway.
+    const internal::EnvironmentSummary summary =
+        internal::SummarizeEnvironment(pixels, width, height, sourceFormat);
+    if (summary.valid) {
+        texture->envValid = true;
+        for (int c = 0; c < 3; ++c) texture->envAverage[c] = summary.average[c];
+        texture->envSunDirection = summary.sunDirection;
+        texture->envPeakLuminance = summary.peakLuminance;
+    }
 
     if (!gpu.AllocSrv(&texture->cpuHandle, &texture->gpuHandle)) {
         delete texture;
@@ -237,18 +292,56 @@ Texture* gDefaultTexture = nullptr;
 
 } // namespace
 
+Texture* LoadHDRFromFile(const char* path, bool generateMips) {
+    if (!path) return nullptr;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        LogError("LoadHDRFromFile: cannot open '%s'", path);
+        return nullptr;
+    }
+
+    uint32_t width = 0, height = 0;
+    std::vector<float> pixels;
+    if (!internal::DecodeHdr(file, &width, &height, &pixels)) {
+        LogError("LoadHDRFromFile: '%s' is not a readable Radiance RGBE image", path);
+        return nullptr;
+    }
+
+    Texture* texture = LoadTextureFromFloats(pixels.data(), width, height, generateMips);
+    if (texture) texture->name = path;
+    return texture;
+}
+
 Texture* LoadTexture(const TextureDesc& desc) {
     if (desc.width == 0 || desc.height == 0 || !desc.pixels) {
         LogError("LoadTexture: width, height and pixels are all required");
         return nullptr;
     }
     return CreateTextureFromPixels(desc.pixels, desc.width, desc.height, desc.generateMips,
-                                   desc.debugName);
+                                   desc.debugName, desc.format, desc.srgb);
 }
 
 Texture* LoadTextureFromMemory(const uint8_t* pixels, uint32_t width, uint32_t height,
                                bool generateMips) {
     return CreateTextureFromPixels(pixels, width, height, generateMips, "(memory)");
+}
+
+Texture* LoadTextureFromFloats(const float* rgba, uint32_t width, uint32_t height,
+                               bool generateMips) {
+    if (!rgba || width == 0 || height == 0) {
+        LogError("LoadTextureFromFloats: width, height and pixels are all required");
+        return nullptr;
+    }
+
+    // Convert to half up front so the upload path stays byte-oriented and there is
+    // one place that knows the storage layout.
+    const size_t count = static_cast<size_t>(width) * height * 4;
+    std::vector<uint16_t> halves(count);
+    for (size_t i = 0; i < count; ++i) halves[i] = FloatToHalf(rgba[i]);
+
+    return CreateTextureFromPixels(reinterpret_cast<const uint8_t*>(halves.data()), width, height,
+                                   generateMips, "(float memory)", TextureFormat::RGBA16F);
 }
 
 Texture* LoadTextureFromFile(const char* path, bool generateMips) {
@@ -327,6 +420,9 @@ void UnloadTexture(Texture* texture) {
 uint32_t TextureWidth(const Texture* texture) { return texture ? texture->width : 0; }
 uint32_t TextureHeight(const Texture* texture) { return texture ? texture->height : 0; }
 const char* TextureName(const Texture* texture) { return texture ? texture->name.c_str() : ""; }
+TextureFormat TexturePixelFormat(const Texture* texture) {
+    return texture ? texture->format : TextureFormat::RGBA8;
+}
 
 Texture* GetDefaultTexture() {
     if (gDefaultTexture) return gDefaultTexture;
@@ -339,4 +435,4 @@ Texture* GetDefaultTexture() {
     return gDefaultTexture;
 }
 
-} // namespace a3d
+} // namespace n3d

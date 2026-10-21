@@ -1,15 +1,15 @@
-// Aurora3D — 2D drawing: shapes, sprites, text and the 2D camera.
+// NexiumEngine — 2D drawing: shapes, sprites, text and the 2D camera.
 //
 // Every function here builds geometry in *pixel* space with the origin at the
 // top-left and hands it to the renderer's overlay pass, which draws it last with
 // depth testing off. When a 2D camera is active the geometry is built in world
 // units instead and the camera's matrix is baked into the vertices, so the
 // overlay pass itself stays a single orthographic projection.
-#include "aurora/draw.h"
+#include "nexium/draw.h"
 
-#include "aurora/log.h"
-#include "aurora/shader.h"
-#include "aurora/texture.h"
+#include "nexium/log.h"
+#include "nexium/shader.h"
+#include "nexium/texture.h"
 
 #include "internal/font_data.h"
 #include "internal/gpu.h"
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 namespace {
 
 // ------------------------------------------------------------- 2D camera ----
@@ -39,6 +39,15 @@ Vec2 ToDrawSpace(Vec2 point) {
     const float width = static_cast<float>(internal::GpuContext::Get().Width());
     const float height = static_cast<float>(internal::GpuContext::Get().Height());
     return gMode2DCamera.WorldToScreen(point, width, height);
+}
+
+// Applies the active camera's scale to a *distance* rather than a point. Shapes
+// built from a centre plus a radius must scale the radius too, otherwise the
+// centre moves with the camera while the outline stays a fixed number of pixels
+// wide. Rotation does not affect a radius, so only the zoom matters.
+float ToDrawRadius(float radius) {
+    if (!gMode2DActive) return radius;
+    return radius * gMode2DCamera.zoom;
 }
 
 Vertex MakeVertex(Vec2 position, Color color, Vec2 uv) {
@@ -212,7 +221,7 @@ void DrawCircle(float centerX, float centerY, float radius, Color color) {
 void DrawCircleV(Vec2 center, float radius, Color color) {
     if (radius <= 0.0f) return;
     std::vector<Vertex> vertices;
-    BuildArc(vertices, ToDrawSpace(center), 0.0f, radius, 0.0f, 360.0f, color);
+    BuildArc(vertices, ToDrawSpace(center), 0.0f, ToDrawRadius(radius), 0.0f, 360.0f, color);
     SubmitTriangles(vertices, nullptr, false);
 }
 
@@ -220,12 +229,13 @@ void DrawCircleLines(Vec2 center, float radius, Color color) {
     if (radius <= 0.0f) return;
 
     const Vec2 screenCenter = ToDrawSpace(center);
+    const float drawRadius = ToDrawRadius(radius);
     const int segments = radius < 8.0f ? 12 : 48;
     const float step = TAU / static_cast<float>(segments);
-    Vec2 previous = screenCenter + Vec2{radius, 0.0f};
+    Vec2 previous = screenCenter + Vec2{drawRadius, 0.0f};
     for (int i = 1; i <= segments; ++i) {
         const float angle = step * static_cast<float>(i);
-        const Vec2 current = screenCenter + Vec2{std::cos(angle), std::sin(angle)} * radius;
+        const Vec2 current = screenCenter + Vec2{std::cos(angle), std::sin(angle)} * drawRadius;
         internal::Renderer::Get().DrawScreenLine(previous, current, color, 1.0f);
         previous = current;
     }
@@ -234,7 +244,8 @@ void DrawCircleLines(Vec2 center, float radius, Color color) {
 void DrawCircleSector(Vec2 center, float radius, float startDegrees, float endDegrees, Color color) {
     if (radius <= 0.0f) return;
     std::vector<Vertex> vertices;
-    BuildArc(vertices, ToDrawSpace(center), 0.0f, radius, startDegrees, endDegrees, color);
+    BuildArc(vertices, ToDrawSpace(center), 0.0f, ToDrawRadius(radius), startDegrees, endDegrees,
+             color);
     SubmitTriangles(vertices, nullptr, false);
 }
 
@@ -242,8 +253,8 @@ void DrawRing(Vec2 center, float innerRadius, float outerRadius, float startDegr
               float endDegrees, Color color) {
     if (outerRadius <= 0.0f || innerRadius >= outerRadius) return;
     std::vector<Vertex> vertices;
-    BuildArc(vertices, ToDrawSpace(center), Max(innerRadius, 0.0f), outerRadius, startDegrees,
-             endDegrees, color);
+    BuildArc(vertices, ToDrawSpace(center), ToDrawRadius(Max(innerRadius, 0.0f)),
+             ToDrawRadius(outerRadius), startDegrees, endDegrees, color);
     SubmitTriangles(vertices, nullptr, false);
 }
 
@@ -262,12 +273,15 @@ void DrawTriangleLines2D(Vec2 a, Vec2 b, Vec2 c, Color color) {
 void DrawPolygon(Vec2 center, int sides, float radius, float rotationDegrees, Color color) {
     if (sides < 3 || radius <= 0.0f) return;
 
-    const std::vector<Vec2> points = PolygonPoints(ToDrawSpace(center), sides, radius,
+    // PolygonPoints works in draw space, so the rim comes back already
+    // transformed; the fan centre must be transformed once as well, not twice.
+    const Vec2 drawCenter = ToDrawSpace(center);
+    const std::vector<Vec2> points = PolygonPoints(drawCenter, sides, ToDrawRadius(radius),
                                                    rotationDegrees);
     std::vector<Vertex> vertices;
     for (size_t i = 0; i < points.size(); ++i) {
         const Vec2& next = points[(i + 1) % points.size()];
-        PushTriangle(vertices, ToDrawSpace(center), points[i], next, color, color, color);
+        PushTriangle(vertices, drawCenter, points[i], next, color, color, color);
     }
     SubmitTriangles(vertices, nullptr, false);
 }
@@ -275,8 +289,8 @@ void DrawPolygon(Vec2 center, int sides, float radius, float rotationDegrees, Co
 void DrawPolygonLines(Vec2 center, int sides, float radius, float rotationDegrees, Color color) {
     if (sides < 3 || radius <= 0.0f) return;
 
-    const std::vector<Vec2> points = PolygonPoints(ToDrawSpace(center), sides, radius,
-                                                   rotationDegrees);
+    const std::vector<Vec2> points = PolygonPoints(ToDrawSpace(center), sides,
+                                                   ToDrawRadius(radius), rotationDegrees);
     for (size_t i = 0; i < points.size(); ++i) {
         internal::Renderer::Get().DrawScreenLine(points[i], points[(i + 1) % points.size()], color,
                                                  1.0f);
@@ -725,4 +739,4 @@ void DrawText3D(const char* text, Vec3 position, float worldSize, Color color) {
     }
 }
 
-} // namespace a3d
+} // namespace n3d

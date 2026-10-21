@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <vector>
 
-using namespace a3d;
+using namespace n3d;
 
 static int gFailures = 0;
 static int gChecks = 0;
@@ -183,6 +183,90 @@ static void TestPlane() {
     }
 }
 
+static void TestTorus() {
+    std::printf("torus\n");
+    std::vector<Vertex> v;
+    std::vector<uint32_t> i;
+    geometry::BuildTorus(v, i, 1.0f, 0.25f, 24, 12);
+
+    // (majorSegments + 1) * (minorSegments + 1) vertices, 2 triangles per quad.
+    CHECK(v.size() == 25u * 13u);
+    CHECK(i.size() == 24u * 12u * 6u);
+    CheckMeshIntegrity("torus", v, i, true);
+    CheckUvRange("torus", v);
+
+    // The tube's centre line is 1 unit from the axis and its radius is 0.25, so
+    // every vertex sits within that band.
+    for (const Vertex& vertex : v) {
+        const float radial = std::sqrt(vertex.position.x * vertex.position.x +
+                                       vertex.position.z * vertex.position.z);
+        CHECK(radial > 0.75f - 1e-3f && radial < 1.25f + 1e-3f);
+        CHECK(Abs(vertex.position.y) <= 0.25f + 1e-3f);
+    }
+}
+
+static void TestPyramid() {
+    std::printf("pyramid\n");
+    std::vector<Vertex> v;
+    std::vector<uint32_t> i;
+    geometry::BuildPyramid(v, i, 2.0f, 3.0f);
+
+    CHECK(v.size() == 16u);   // 4 sides x 3 + base quad
+    CHECK(i.size() == 18u);   // 6 triangles
+    CheckMeshIntegrity("pyramid", v, i, true);
+    CheckUvRange("pyramid", v);
+
+    // Base at -height/2, apex at +height/2, matching the other primitives.
+    float lowest = 1e30f, highest = -1e30f;
+    for (const Vertex& vertex : v) {
+        lowest = Min(lowest, vertex.position.y);
+        highest = Max(highest, vertex.position.y);
+    }
+    CHECK(Near(lowest, -1.5f));
+    CHECK(Near(highest, 1.5f));
+}
+
+static void TestDisk() {
+    std::printf("disk\n");
+    std::vector<Vertex> v;
+    std::vector<uint32_t> i;
+    geometry::BuildDisk(v, i, 2.0f, 16);
+
+    CHECK(v.size() == 18u);   // centre + 17 rim (last repeats the first)
+    CHECK(i.size() == 16u * 3u);
+    CheckMeshIntegrity("disk", v, i, true);
+    CheckUvRange("disk", v);
+
+    for (const Vertex& vertex : v) {
+        CHECK(Near(vertex.position.y, 0.0f));
+        CHECK(Near(vertex.normal.y, 1.0f));
+        const float radial = std::sqrt(vertex.position.x * vertex.position.x +
+                                       vertex.position.z * vertex.position.z);
+        CHECK(radial <= 2.0f + 1e-3f);
+    }
+}
+
+static void TestCapsule() {
+    std::printf("capsule\n");
+    std::vector<Vertex> v;
+    std::vector<uint32_t> i;
+    geometry::BuildCapsule(v, i, 0.5f, 1.0f, 16, 6);
+
+    CheckMeshIntegrity("capsule", v, i, true);
+    CheckUvRange("capsule", v);
+
+    // Total extent is height + 2 * radius in Y and 2 * radius across.
+    float minY = 1e30f, maxY = -1e30f, maxRadial = 0.0f;
+    for (const Vertex& vertex : v) {
+        minY = Min(minY, vertex.position.y);
+        maxY = Max(maxY, vertex.position.y);
+        maxRadial = Max(maxRadial, std::sqrt(vertex.position.x * vertex.position.x +
+                                             vertex.position.z * vertex.position.z));
+    }
+    CHECK(Near(maxY - minY, 2.0f));
+    CHECK(Near(maxRadial, 0.5f));
+}
+
 static void TestDegenerateInputs() {
     std::printf("degenerate parameters\n");
     std::vector<Vertex> v;
@@ -204,6 +288,24 @@ static void TestDegenerateInputs() {
     geometry::BuildPlane(v, i, 1.0f, 1.0f, 0);
     CHECK(!v.empty());
     CheckMeshIntegrity("plane(clamped)", v, i, true);
+
+    v.clear();
+    i.clear();
+    geometry::BuildTorus(v, i, 1.0f, 0.2f, 0, 0);
+    CHECK(!v.empty());
+    CheckMeshIntegrity("torus(clamped)", v, i, true);
+
+    v.clear();
+    i.clear();
+    geometry::BuildDisk(v, i, 1.0f, 0);
+    CHECK(!v.empty());
+    CheckMeshIntegrity("disk(clamped)", v, i, true);
+
+    v.clear();
+    i.clear();
+    geometry::BuildCapsule(v, i, 0.5f, 1.0f, 0, 0);
+    CHECK(!v.empty());
+    CheckMeshIntegrity("capsule(clamped)", v, i, true);
 }
 
 int main() {
@@ -212,6 +314,10 @@ int main() {
     TestCylinder();
     TestCone();
     TestPlane();
+    TestTorus();
+    TestPyramid();
+    TestDisk();
+    TestCapsule();
     TestDegenerateInputs();
 
     std::printf("\n%d checks, %d failures\n", gChecks, gFailures);

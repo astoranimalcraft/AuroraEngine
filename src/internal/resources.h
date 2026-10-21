@@ -1,4 +1,4 @@
-// Aurora3D — internal resource definitions.
+// NexiumEngine — internal resource definitions.
 //
 // The public headers expose Texture / Mesh / Shader as opaque forward-declared
 // types. Their real definitions live here so that the renderer, the resource
@@ -6,7 +6,8 @@
 // application code.
 #pragma once
 
-#include "aurora/shader.h"
+#include "nexium/shader.h"
+#include "nexium/texture.h"
 
 #include "internal/common.h"
 
@@ -15,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace a3d {
+namespace n3d {
 
 // The public headers keep Texture/Mesh/Shader opaque, so the COM smart pointer
 // alias has to be visible here too.
@@ -31,6 +32,15 @@ struct Texture {
     D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle{};
     D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle{};
     std::string name;
+    TextureFormat format = TextureFormat::RGBA8;
+    // A cheap summary of an equirectangular environment map, computed once at
+    // upload time from the pixels the caller already had in memory. It is what
+    // makes UpdateLightingFromSky() possible without reading the texture back off
+    // the GPU. Meaningless when `envValid` is false.
+    bool envValid = false;
+    float envAverage[3] = {0.0f, 0.0f, 0.0f};
+    Vec3 envSunDirection{0.0f, 1.0f, 0.0f};
+    float envPeakLuminance = 0.0f;
     bool isDefault = false;
 };
 
@@ -92,15 +102,20 @@ struct Shader {
 
     // PSO cache indexed by [blend][cull][depth].
     ComPtr<ID3D12PipelineState> pipelineCache[3][3][3];
+    // Depth-only variants for the shadow pass, indexed by cull. They have no pixel
+    // shader and no render target, so the pass writes nothing but depth.
+    ComPtr<ID3D12PipelineState> shadowPipelineCache[3];
     std::string name;
 
     // Creates (or fetches from the cache) the PSO for the given render state.
     ID3D12PipelineState* GetPipeline(BlendMode blend, CullMode cull, DepthTest depth);
+    // Creates (or fetches) the depth-only PSO used by the shadow pass.
+    ID3D12PipelineState* GetShadowPipeline(CullMode cull);
 };
 
 namespace internal {
 
-// The root signature every Aurora3D shader is built against. Created once.
+// The root signature every NexiumEngine shader is built against. Created once.
 class RootSignature {
 public:
     static RootSignature& Instance();
@@ -131,15 +146,18 @@ BlendMode CurrentBlendMode();
 CullMode CurrentCullMode();
 DepthTest CurrentDepthTest();
 
-// Built-in shaders, created once during a3d::Init().
+// Built-in shaders, created once during n3d::Init().
 bool CreateBuiltinShaders();
 void DestroyBuiltinShaders();
 Shader* LineShader();
 Shader* TextShader();
+// The environment sky shader. Compiled on first use rather than at init, since a
+// program that never draws a sky should not pay for the compile.
+Shader* SkyShader();
 
-// Built-in bitmap font, created once during a3d::Init().
+// Built-in bitmap font, created once during n3d::Init().
 bool CreateBuiltinFont();
 void DestroyBuiltinFont();
 
 } // namespace internal
-} // namespace a3d
+} // namespace n3d

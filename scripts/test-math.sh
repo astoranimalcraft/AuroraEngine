@@ -2,7 +2,7 @@
 # Runs the platform-independent tests natively on this machine.
 #
 # The math, colour and geometry layers have no Windows dependency, so unlike the
-# rest of Aurora3D they can be compiled with the host compiler and executed for
+# rest of NexiumEngine they can be compiled with the host compiler and executed for
 # real. This is the fastest feedback loop while working on them.
 #
 #   ./scripts/test-math.sh            run the tests

@@ -1,11 +1,11 @@
 // Native (host-independent) tests for the portable math core.
 // Build & run with scripts/test-math.sh — no DirectX required.
-#include "aurora/math.h"
+#include "nexium/math.h"
 
 #include <cstdio>
 #include <cstring>
 
-using namespace a3d;
+using namespace n3d;
 
 static int gFailures = 0;
 static int gChecks = 0;
@@ -148,6 +148,135 @@ static void TestBounds() {
     CHECK(Near(b.Radius(), std::sqrt(3.0f)));
 }
 
+static void TestToEuler() {
+    std::printf("to euler (inverse of RotationEuler)\n");
+
+    // ToEuler() must invert RotationEuler() exactly, for any angle triple. An
+    // earlier version used the wrong element order and only round-tripped when
+    // one of the three angles was zero, so an arbitrary triple is the real test.
+    const Vec3 cases[] = {
+        {Radians(20), Radians(35), Radians(10)},
+        {Radians(-40), Radians(120), Radians(-25)},
+        {Radians(15), Radians(-70), Radians(80)},
+        {0, 0, 0},
+        {Radians(30), 0, 0},
+        {0, Radians(90), 0},
+        {0, 0, Radians(45)},
+        {Radians(12), Radians(200), Radians(-160)},
+    };
+
+    for (const Vec3& euler : cases) {
+        const Mat4 original = RotationEuler(euler);
+        const Mat4 rebuilt = RotationEuler(ToEuler(original));
+        for (int i = 0; i < 16; ++i) CHECK(Near(original.m[i], rebuilt.m[i], 1e-4f));
+    }
+
+    // The extracted angles must also match the input when it is already canonical
+    // (pitch within +-90 degrees).
+    const Vec3 euler{Radians(20), Radians(35), Radians(10)};
+    const Vec3 back = ToEuler(RotationEuler(euler));
+    CHECK(Near(back.x, euler.x, 1e-4f));
+    CHECK(Near(back.y, euler.y, 1e-4f));
+    CHECK(Near(back.z, euler.z, 1e-4f));
+
+    // At the gimbal-lock pole the extraction must still produce a valid rotation
+    // rather than NaNs.
+    const Mat4 locked = RotationEuler({Radians(90), Radians(45), 0});
+    const Mat4 lockedBack = RotationEuler(ToEuler(locked));
+    for (int i = 0; i < 16; ++i) {
+        CHECK(lockedBack.m[i] == lockedBack.m[i]);   // not NaN
+        CHECK(Near(locked.m[i], lockedBack.m[i], 1e-4f));
+    }
+}
+
+static void TestCollision() {
+    std::printf("collision\n");
+
+    // Spheres: touching counts, a gap does not.
+    CHECK(CheckCollisionSpheres({0, 0, 0}, 1.0f, {1.5f, 0, 0}, 1.0f));
+    CHECK(!CheckCollisionSpheres({0, 0, 0}, 1.0f, {2.5f, 0, 0}, 1.0f));
+
+    // Boxes.
+    Bounds a, b;
+    a.Grow({0, 0, 0});
+    a.Grow({2, 2, 2});
+    b.Grow({1, 1, 1});
+    b.Grow({3, 3, 3});
+    CHECK(CheckCollisionBoxes(a, b));
+    Bounds farAway;
+    farAway.Grow({10, 10, 10});
+    farAway.Grow({11, 11, 11});
+    CHECK(!CheckCollisionBoxes(a, farAway));
+    CHECK(!CheckCollisionBoxes(a, Bounds{}));   // invalid box never collides
+    CHECK(CheckCollisionPointBox({1, 1, 1}, a));
+    CHECK(!CheckCollisionPointBox({3, 1, 1}, a));
+
+    // Ray vs. sphere: a forward hit reports the near intersection.
+    Ray ray;
+    ray.origin = {0, 0, -5};
+    ray.direction = {0, 0, 1};
+    float distance = -1.0f;
+    CHECK(CheckCollisionRaySphere(ray, {0, 0, 0}, 1.0f, &distance));
+    CHECK(Near(distance, 4.0f, 0.01f));
+    CHECK(!CheckCollisionRaySphere(ray, {0.5f, 0, 0}, 0.4f));         // passes beside it
+    CHECK(!CheckCollisionRaySphere(ray, {0, 0, -100}, 1.0f));         // behind the origin
+
+    // Starting inside the sphere reports distance 0.
+    ray.origin = {0, 0, 0};
+    CHECK(CheckCollisionRaySphere(ray, {0, 0, 0}, 1.0f, &distance));
+    CHECK(Near(distance, 0.0f));
+
+    // Ray vs. box.
+    ray.origin = {0, 0, -5};
+    ray.direction = {0, 0, 1};
+    CHECK(RayHitsBounds(ray, a, &distance));
+    CHECK(Near(distance, 5.0f, 0.01f));
+    CHECK(!RayHitsBounds(ray, farAway));
+
+    // 2D circles and rectangles.
+    CHECK(CheckCollisionCircles({0, 0}, 1.0f, {1.5f, 0}, 1.0f));
+    CHECK(!CheckCollisionCircles({0, 0}, 1.0f, {3, 0}, 1.0f));
+    CHECK(CheckCollisionPointCircle({0.5f, 0.5f}, {0, 0}, 1.0f));
+    Rect rect{0, 0, 10, 10};
+    CHECK(CheckCollisionPointRect({5, 5}, rect));
+    CHECK(!CheckCollisionPointRect({15, 5}, rect));
+    CHECK(CheckCollisionRecs(rect, Rect{5, 5, 10, 10}));
+    CHECK(!CheckCollisionRecs(rect, Rect{20, 20, 5, 5}));
+
+    // The overlap rectangle.
+    const Rect overlap = GetCollisionRec(rect, Rect{5, 5, 10, 10});
+    CHECK(Near(overlap.x, 5.0f));
+    CHECK(Near(overlap.y, 5.0f));
+    CHECK(Near(overlap.width, 5.0f));
+    CHECK(Near(overlap.height, 5.0f));
+    CHECK(GetCollisionRec(rect, Rect{20, 20, 5, 5}).width == 0.0f);
+
+    // Segment-segment crossing.
+    Vec2 point;
+    CHECK(CheckCollisionLines({0, 0}, {10, 10}, {0, 10}, {10, 0}, &point));
+    CHECK(Near(point.x, 5.0f, 0.01f) && Near(point.y, 5.0f, 0.01f));
+    CHECK(!CheckCollisionLines({0, 0}, {1, 1}, {2, 2}, {3, 3}));        // parallel
+    CHECK(!CheckCollisionLines({0, 0}, {1, 0}, {5, 5}, {6, 5}));        // apart
+
+    // Point in a triangle, both windings.
+    CHECK(CheckCollisionPointTriangle({0.25f, 0.25f}, {0, 0}, {1, 0}, {0, 1}));
+    CHECK(CheckCollisionPointTriangle({0.25f, 0.25f}, {0, 0}, {0, 1}, {1, 0}));
+    CHECK(!CheckCollisionPointTriangle({2, 2}, {0, 0}, {1, 0}, {0, 1}));
+
+    // Closest point on a box, and the distance between two segments.
+    CHECK(Near(ClosestPointOnBox({5, 1, 1}, a), Vec3{2, 1, 1}));
+    CHECK(Near(ClosestPointOnBox({-5, -5, -5}, a), Vec3{0, 0, 0}));
+    CHECK(Near(ClosestPointOnRect({-5, 5}, rect).x, 0.0f));
+    CHECK(Near(ClosestPointOnRect({-5, 5}, rect).y, 5.0f));
+
+    float s = -1.0f, t = -1.0f;
+    // Two skew segments: the closest approach is 1 unit apart.
+    const float distanceSq = ClosestPointsBetweenSegments({0, 0, 0}, {10, 0, 0},
+                                                          {0, 0, 1}, {10, 0, 1}, &s, &t);
+    CHECK(Near(distanceSq, 1.0f, 0.01f));
+    CHECK(s >= 0.0f && s <= 1.0f && t >= 0.0f && t <= 1.0f);
+}
+
 int main() {
     TestVectors();
     TestMatrixLayout();
@@ -157,7 +286,9 @@ int main() {
     TestProjection();
     TestLookAt();
     TestQuat();
+    TestToEuler();
     TestBounds();
+    TestCollision();
 
     std::printf("\n%d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

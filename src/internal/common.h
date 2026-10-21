@@ -1,4 +1,4 @@
-// Aurora3D — internal shared definitions.
+// NexiumEngine — internal shared definitions.
 // Only included by .cpp files under src/. Never exposed to applications.
 #pragma once
 
@@ -28,20 +28,27 @@
 #undef DrawTextEx
 #undef PlaySound
 
+// The same trap for the platform backend: CreateWindow/CreateWindowEx and
+// DestroyWindow are macros expanding to their A/W forms, and PlatformBackend
+// declares methods with those names.
+#undef CreateWindow
+#undef CreateWindowEx
+#undef DestroyWindow
+
 #include <cstdint>
 #include <cstring>
 
-#include "aurora/color.h"
-#include "aurora/math.h"
-#include "aurora/mesh.h"
+#include "nexium/color.h"
+#include "nexium/math.h"
+#include "nexium/mesh.h"
 
-namespace a3d::internal {
+namespace n3d::internal {
 
 using Microsoft::WRL::ComPtr;
 
 // ------------------------------------------------------------- constants -----
 // Frame and object constant blocks are bound as 32-bit root constants, so their
-// sizes must match the HLSL cbuffer declarations in shaders/aurora.hlsli
+// sizes must match the HLSL cbuffer declarations in shaders/nexium.hlsli
 // exactly (both are 28 DWORDs = 112 bytes).
 inline constexpr uint32_t kFrameConstantCount = 28;
 inline constexpr uint32_t kObjectConstantCount = 28;
@@ -60,10 +67,11 @@ inline constexpr uint32_t kInitialIndexCapacity = 1u << 17;
 // slots are stable for the lifetime of the texture that owns them.
 inline constexpr uint32_t kSrvHeapCapacity = 1024;
 inline constexpr uint32_t kRtvHeapCapacity = 8;
+// Slot 0 is the swap chain depth buffer; slot 1 is the shadow map.
 inline constexpr uint32_t kDsvHeapCapacity = 4;
 
 // ------------------------------------------------------ GPU-side structs -----
-// Layout must match shaders/aurora.hlsli.
+// Layout must match shaders/nexium.hlsli.
 struct FrameConstants {
     Mat4 viewProj;
     float cameraPosTime[4];
@@ -81,21 +89,36 @@ struct ObjectConstants {
 };
 static_assert(sizeof(ObjectConstants) == kObjectConstantCount * sizeof(uint32_t));
 
-// A vertex as uploaded to the GPU. The engine uses the public a3d::Vertex (the
+// A vertex as uploaded to the GPU. The engine uses the public n3d::Vertex (the
 // same type applications pass to CreateMesh) so the two layouts can never drift
-// apart. Mirrors A3D_VertexInput in shaders/aurora.hlsli.
-using Vertex = a3d::Vertex;
+// apart. Mirrors N3D_VertexInput in shaders/nexium.hlsli.
+using Vertex = n3d::Vertex;
 static_assert(sizeof(Vertex) == 48);
 
-// Object flags shared with HLSL (A3D_FLAG_*).
+// Object flags shared with HLSL (N3D_FLAG_*).
 enum ObjectFlags : uint32_t {
     kFlagUnlit    = 1u << 0,
     kFlagTextured = 1u << 1,
     kFlagTwoSided = 1u << 2,
+    kFlagNoShadow = 1u << 3,   // excluded from the shadow pass
 };
+
+// --------------------------------------------------------------- shadows -----
+// Bound as a root CBV at b2 rather than root constants: the light matrix alone is
+// 16 DWORDs, and the root signature only has 64 DWORDs to spend across every
+// parameter. A root CBV costs 2 DWORDs no matter how large the block is, so this
+// keeps the signature inside the limit while leaving room to grow.
+struct ShadowConstants {
+    Mat4 lightViewProj;
+    float lightParams[4];   // x = enabled, y = depth bias, z = normal bias, w = texel size
+    float shadowParams[4];  // x = 1/width, y = 1/height, z = pcf radius, w = unused
+};
+static_assert(sizeof(ShadowConstants) == 24 * sizeof(uint32_t));
+
+inline constexpr uint32_t kShadowConstantBytes = 256;   // CBV size must be 256-aligned
 
 inline uint32_t AlignUp(uint32_t value, uint32_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-} // namespace a3d::internal
+} // namespace n3d::internal
